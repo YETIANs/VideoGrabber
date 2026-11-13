@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地视频提取</title>
+<style>
+  :root{
+    --bg:#f6f6f7; --card:#fff; --line:#e6e6e9; --line-strong:#d6d6db;
+    --text:#16161a; --muted:#6c6c76; --faint:#9a9aa4;
+    --accent:#16161a; --ok:#0f7a53; --err:#c8322f;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:56px 22px 90px}
+
+  header{margin-bottom:26px}
+  h1{font-size:23px;font-weight:600;margin:0 0 6px;letter-spacing:-.2px}
+  .sub{color:var(--muted);font-size:14px;margin:0}
+
+  .composer{
+    display:flex;gap:10px;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--radius);padding:10px;box-shadow:0 1px 2px rgba(16,16,20,.04)
+  }
+
+  .pgrid{
+    display:grid;grid-template-columns:repeat(6,minmax(0,1fr));
+    gap:7px;margin-bottom:12px
+  }
+  .pitem{
+    display:flex;align-items:center;justify-content:center;height:38px;
+    border-radius:10px;background:#fff;border:1px solid var(--line);
+    font-size:12.5px;color:#3a3a44;cursor:pointer;user-select:none;
+    transition:.14s;white-space:nowrap;overflow:hidden
+  }
+  .pitem:hover{border-color:var(--line-strong);background:#fafafa}
+  .pitem.on{background:#16161a;border-color:#16161a;color:#fff}
+  .pitem.on::after{content:"";width:5px;height:5px;border-radius:50%;
+    background:#7ee2b8;margin-left:6px;flex:none}
+  .composer:focus-within{border-color:var(--line-strong);box-shadow:0 2px 10px rgba(16,16,20,.06)}
+  #url{
+    flex:1;border:0;outline:0;background:transparent;font-size:15px;
+    padding:9px 8px;color:var(--text);font-family:inherit;min-width:0
+  }
+  #url::placeholder{color:var(--faint)}
+  .btn{
+    border:0;border-radius:10px;font-family:inherit;font-size:14px;font-weight:500;
+    cursor:pointer;padding:0 18px;height:42px;transition:.15s;white-space:nowrap
+  }
+  .btn.primary{background:var(--accent);color:#fff}
+  .btn.primary:hover:not(:disabled){background:#000}
+  .btn.ghost{background:#f1f1f3;color:var(--text)}
+  .btn.ghost:hover:not(:disabled){background:#e8e8ec}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn.sm{height:34px;padding:0 14px;font-size:13px;border-radius:8px}
+
+  .hint{color:var(--faint);font-size:12.5px;margin:10px 2px 0}
+
+  #msg{margin-top:14px;font-size:14px;display:none;padding:11px 14px;border-radius:10px}
+  #msg.err{display:block;background:#fdf0ef;color:var(--err);border:1px solid #f6d5d3}
+  #msg.info{display:block;background:#f1f1f3;color:var(--muted);border:1px solid var(--line)}
+
+  .card{
+    background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+    padding:20px;margin-top:18px;box-shadow:0 1px 2px rgba(16,16,20,.04)
+  }
+  .card h2{font-size:14px;font-weight:600;margin:0 0 14px;color:var(--muted);letter-spacing:.2px}
+  .vtitle{
+    font-size:13.5px;color:var(--text);line-height:1.5;margin:-6px 0 14px;
+    padding:9px 12px;background:#f7f7f9;border-radius:9px;display:none
+  }
+  .vtitle.on{display:block}
+
+  .stream{
+    display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid #f0f0f2
+  }
+  .stream:first-of-type{border-top:0;padding-top:2px}
+  .badge{
+    font-size:12px;font-weight:600;padding:4px 9px;border-radius:7px;
+    background:#f1f1f3;color:#3a3a44;min-width:62px;text-align:center;flex:none
+  }
+  .badge.hot{background:#16161a;color:#fff}
+  .sdesc{flex:1;font-size:13.5px;color:var(--muted);min-width:0}
+  .sdesc b{color:var(--text);font-weight:500}
+
+  .namerow{display:flex;align-items:center;gap:8px;margin-top:16px;padding-top:16px;border-top:1px solid #f0f0f2}
+  .namerow label{font-size:13px;color:var(--muted);flex:none}
+  #name{
+    flex:1;border:1px solid var(--line);border-radius:9px;padding:9px 11px;
+    font-family:inherit;font-size:14px;color:var(--text);outline:0;min-width:0;background:#fbfbfc
+  }
+  #name:focus{border-color:var(--line-strong);background:#fff}
+  .ext{font-size:13px;color:var(--faint);flex:none}
+
+  .task{border-top:1px solid #f0f0f2;padding:14px 0;display:flex;align-items:center;gap:14px}
+  .task:first-of-type{border-top:0;padding-top:2px}
+  .tname{font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}
+  .tstage{font-size:12.5px;color:var(--muted);margin-top:2px}
+  .bar{height:4px;background:#eeeef1;border-radius:3px;overflow:hidden;margin-top:8px;width:100%}
+  .bar > i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s ease}
+  .bar.done > i{background:var(--ok)}
+  .bar.err > i{background:var(--err)}
+  .tgrow{flex:1;min-width:0}
+  .tend{font-size:12.5px;color:var(--ok);flex:none;font-weight:500}
+  .tend.bad{color:var(--err)}
+
+  .files{list-style:none;margin:0;padding:0}
+  .files li{
+    display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid #f0f0f2;font-size:13.5px
+  }
+  .files li:first-child{border-top:0}
+  .fname{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fsize{color:var(--faint);font-size:12.5px;flex:none;font-variant-numeric:tabular-nums}
+  .lnk{color:var(--muted);text-decoration:none;font-size:12.5px;flex:none;border-bottom:1px solid var(--line-strong)}
+  .lnk:hover{color:var(--text)}
+  .empty{color:var(--faint);font-size:13.5px}
+
+  .pathrow{
+    display:flex;align-items:center;gap:8px;margin-top:14px;padding-top:14px;
+    border-top:1px solid #f0f0f2
+  }
+  .plabel{font-size:12.5px;color:var(--muted);flex:none}
+  #outpath{
+    flex:1;border:1px solid transparent;background:#f7f7f9;border-radius:8px;
+    padding:7px 10px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;
+    color:var(--text);outline:0;min-width:0
+  }
+  #outpath:hover{border-color:var(--line)}
+  #outpath:focus{border-color:var(--line-strong);background:#fff}
+  #pickdir{height:30px;padding:0 12px;font-size:12.5px}
+
+  .cardhead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+  .cardhead h2{margin:0}
+  .ckbtn{display:flex;gap:6px;flex:none}
+  .ckrow{
+    display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid #f0f0f2;
+    font-size:13.5px
+  }
+  .ckrow:first-child{border-top:0;padding-top:0}
+  .dot{width:7px;height:7px;border-radius:50%;background:#d2d2d8;flex:none}
+  .dot.on{background:#0f7a53}
+  .ckname{width:112px;flex:none;font-weight:500}
+  .cknote{flex:1;color:var(--muted);font-size:12.5px;min-width:0;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ckstate{flex:none;font-size:12px;color:var(--faint)}
+  .ckstate.on{color:var(--ok);font-weight:500}
+  .ckhint{
+    margin:12px 0 0;padding-top:12px;border-top:1px solid #f0f0f2;
+    font-size:11.5px;color:var(--faint);line-height:1.6;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+  }
+  .ckguide{
+    background:#fafafa;border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px 12px;margin-bottom:14px
+  }
+  .ckguide ol{margin:0;padding-left:18px;font-size:12.5px;line-height:1.85;color:#4a4a54}
+  .ckguide li{margin-bottom:2px}
+  .ckguide b{color:var(--text);font-weight:500}
+  .ckguide code{
+    font-family:ui-monospace,Consolas,monospace;font-size:11.5px;
+    background:#eeeef1;padding:1px 5px;border-radius:4px
+  }
+  .ckwarn{
+    margin:10px 0 0;padding-top:10px;border-top:1px dashed var(--line);
+    font-size:11.5px;color:#a15a1a;line-height:1.6
+  }
+  .ckway{margin:0 0 8px;font-size:12.5px;line-height:1.7;color:#4a4a54}
+  .ckway b{color:var(--text);font-weight:500}
+  .ckguide a{color:#1a56db;text-decoration:none;border-bottom:1px solid #c2d6f2}
+  .ckguide a:hover{color:#123c9c;border-bottom-color:#123c9c}
+  .browbox{margin-top:14px;padding-top:11px;border-top:1px solid #f0f0f2}
+  .browhead{font-size:11.5px;color:var(--faint);margin-bottom:4px}
+  .browbox .ckrow{padding:6px 0;border-top:0}
+  .browbox .ckrow:first-child{padding-top:4px}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+  .chip{
+    font-size:12px;padding:4px 11px;border-radius:7px;background:#f4f4f6;
+    color:#3a3a44;cursor:pointer;border:1px solid transparent;
+    user-select:none;transition:.12s
+  }
+  .chip:hover{background:#ebebef;border-color:var(--line)}
+  .chip.on{background:#16161a;color:#fff}
+
+  footer{margin-top:26px;color:var(--faint);font-size:12px;text-align:center;line-height:1.8}
+  code{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:#eeeef1;padding:1px 5px;border-radius:4px}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid #d8d8dd;border-top-color:#16161a;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>本地视频提取</h1>
+    <p class="sub">贴链接，选画质，文件直接存到这台电脑上。</p>
+  </header>
+
+  <div class="pgrid" id="pgrid"></div>
+
+  <div class="composer">
+    <input id="url" type="text" placeholder="粘贴视频链接 …" autocomplete="off" spellcheck="false">
+    <button class="btn ghost" id="paste">粘贴</button>
+    <button class="btn primary" id="go">提取</button>
+  </div>
+  <p class="hint" id="hint">回车即可开始 · 视频站 / 音乐站 / 社交平台链接都行</p>
+
+  <div id="msg"></div>
+
+  <section class="card" id="result" hidden>
+    <h2>可用画质</h2>
+    <div class="vtitle" id="vtitle"></div>
+    <div id="streams"></div>
+    <div class="namerow">
+      <label for="name">保存为</label>
+      <input id="name" type="text" spellcheck="false">
+      <span class="ext" id="ext">.mp4</span>
+    </div>
+  </section>
+
+  <section class="card" id="tasksCard" hidden>
+    <h2>任务</h2>
+    <div id="tasks"></div>
+  </section>
+
+  <section class="card">
+    <div class="cardhead">
+      <h2>平台登录状态</h2>
+      <span class="ckbtn">
+        <button class="btn ghost sm" id="ckstore">装插件</button>
+        <button class="btn ghost sm" id="ckhow">怎么拿？</button>
+        <button class="btn ghost sm" id="ckimport">导入文件</button>
+        <button class="btn ghost sm" id="ckdel" hidden>移除</button>
+      </span>
+    </div>
+    <div class="ckguide" id="ckguide" hidden>
+      <p class="ckway"><b>方式一：装商店插件</b>（推荐，一键搞定）</p>
+      <ol>
+        <li>点右上角「<b>装插件</b>」→ 打开 Chrome 应用商店</li>
+        <li>点「<b>添加至 Chrome</b>」→ 确认，几秒装好</li>
+        <li>打开要下载的网站（确认已登录）→ 点工具栏的插件图标 → <b>Export</b> 导出</li>
+        <li>回到本页点「<b>导入文件</b>」，选中刚下载的文件</li>
+      </ol>
+      <p class="ckway">插件地址（手动打开也行）：
+        <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
+           target="_blank" rel="noreferrer">Get cookies.txt LOCALLY</a>
+      </p>
+      <p class="ckway">Edge 用户：<a href="https://microsoftedge.microsoft.com/addons/search/cookies.txt"
+           target="_blank" rel="noreferrer">Edge 加载项商店搜 cookies.txt</a>，
+        或在 Edge 里直接打开上面的 Chrome 商店链接（需允许其他商店）。</p>
+      <p class="ckway">多个平台就逐个导出、逐个导入，<b>会合并</b>，不会互相覆盖。</p>
+      <p class="ckwarn">cookies.txt 等于你的登录凭证：别发给别人，别传到网盘。想撤销授权，点「移除」即可。</p>
+    </div>
+    <div id="cklist"></div>
+    <div class="browbox">
+      <div class="browhead">浏览器（cookie 来源）</div>
+      <div id="browlist"></div>
+    </div>
+    <p class="ckhint" id="ckhint"></p>
+    <input type="file" id="ckfile" accept=".txt,text/plain" hidden>
+  </section>
+
+  <section class="card">
+    <h2>已保存到本地</h2>
+    <ul class="files" id="files"></ul>
+    <div class="pathrow">
+      <span class="plabel">保存位置</span>
+      <input id="outpath" type="text" spellcheck="false" autocomplete="off"
+             title="可直接改路径，回车确认；或点右侧「浏览」选文件夹">
+      <button class="btn ghost sm" id="pickdir">浏览</button>
+    </div>
+    <div class="chips" id="chips"></div>
+  </section>
+
+  <footer>所有解析和下载都在这台电脑上完成 · 不上传任何数据 · 关闭命令行窗口即停止服务</footer>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let cur = null;
+let polling = new Set();
+
+function fmtSize(b){
+  if(!b) return "0 B";
+  const u=["B","KB","MB","GB"]; let i=0; let n=b;
+  while(n>=1024 && i<u.length-1){n/=1024;i++}
+  return n.toFixed(n<10&&i>0?2:0)+" "+u[i];
+}
+function showMsg(text, kind){
+  const m=$("#msg"); m.className=kind||"info"; m.textContent=text;
+  m.style.display = text ? "block" : "none";
+}
+function clearMsg(){ showMsg("") }
+
+async function api(path, body){
+  const r = await fetch(path, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(body||{})
+  });
+  return r.json();
+}
+
+async function loadEnv(){
+  try{
+    const r = await fetch("/api/env"); const d = await r.json();
+    $("#outpath").value = d.out;
+    renderPlaces(d.places || []);
+    if(!d.ffmpeg) $("#hint").textContent = "未检测到 ffmpeg · 只能下载单文件版画质";
+  }catch(e){}
+}
+
+function renderPlaces(places){
+  const box = $("#chips");
+  if(!places.length){ box.innerHTML = ""; return; }
+  box.innerHTML = places.map(p =>
+    `<span class="chip" data-p="${esc(p.path)}">${esc(p.name)}</span>`).join("");
+  box.querySelectorAll(".chip").forEach(c => {
+    c.onclick = async () => {
+      const d = await api("/api/config", {out: c.dataset.p});
+      if(d.error){ showMsg(d.error, "err"); return; }
+      $("#outpath").value = d.out;
+      box.querySelectorAll(".chip").forEach(x => x.classList.remove("on"));
+      c.classList.add("on");
+      loadFiles();
+    };
+  });
+}
+
+async function loadFiles(){
+  try{
+    const r = await fetch("/api/files"); const d = await r.json();
+    if(d.out) $("#outpath").value = d.out;
+    const ul = $("#files");
+    if(!d.files || !d.files.length){
+      ul.innerHTML = '<li class="empty">这个目录里还没有文件</li>'; return;
+    }
+    ul.innerHTML = d.files.map(f => `
+      <li>
+        <span class="fname" title="${esc(f.name)}">${esc(f.name)}</span>
+        <span class="fsize">${fmtSize(f.size)}</span>
+        <a class="lnk" href="/file?n=${encodeURIComponent(f.name)}">另存为</a>
+      </li>`).join("");
+  }catch(e){}
+}
+
+$("#pickdir").onclick = async () => {
+  const btn = $("#pickdir");
+  btn.disabled = true; btn.textContent = "…";
+  try{
+    const d = await (await fetch("/api/pick-dir")).json();
+    if(d.ok){
+      $("#outpath").value = d.out;
+      showMsg("保存位置已改为 " + d.out, "info");
+      loadFiles();
+    } else if(d.hint){
+      showMsg(d.hint, "info");
+      $("#outpath").focus();
+    } else if(d.error){
+      showMsg(d.error, "err");
+    }
+  }catch(e){
+    showMsg("打开选择框失败：" + e.message, "err");
+  }finally{
+    btn.disabled = false; btn.textContent = "浏览";
+  }
+};
+
+$("#outpath").addEventListener("keydown", async e => {
+  if(e.key !== "Enter") return;
+  e.target.blur();
+  const v = e.target.value.trim();
+  if(!v) { loadEnv(); return; }
+  const d = await api("/api/config", {out: v});
+  if(d.error){ showMsg(d.error, "err"); loadEnv(); return; }
+  e.target.value = d.out;
+  showMsg("保存位置已改为 " + d.out, "info");
+  loadFiles();
+});
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+$("#paste").onclick = async () => {
+  try{
+    const t = await navigator.clipboard.readText();
+    if(t){ $("#url").value = t.trim(); $("#url").focus(); }
+  }catch(e){
+    showMsg("浏览器不允许读取剪贴板，直接 Ctrl+V 粘贴即可", "info");
+  }
+};
+
+$("#url").addEventListener("keydown", e => { if(e.key === "Enter") doParse(); });
+$("#go").onclick = doParse;
+
+async function doParse(){
+  const url = $("#url").value.trim();
+  if(!url) { showMsg("先贴个链接", "err"); return; }
+  clearMsg();
+  $("#result").hidden = true;
+  $("#go").disabled = true; $("#go").textContent = "提取中";
+  try{
+    const d = await api("/api/parse", {url});
+    if(d.error){ showMsg(d.error, "err"); return; }
+    if(!d.ok){ showMsg("没有取到可下载的地址", "err"); return; }
+    if(d.url && d.url !== url){
+      $("#url").value = d.url;
+      showMsg("已从分享文字里认出链接：" + d.url, "info");
+    }
+    cur = d;
+    const vt = $("#vtitle");
+    if(d.title){ vt.textContent = d.title; vt.classList.add("on"); }
+    else { vt.textContent = ""; vt.classList.remove("on"); }
+    renderStreams(d);
+    $("#name").value = d.suggest || "video";
+    const hasVideo = d.videos && d.videos.length;
+    const hasAudio = d.audios && d.audios.length;
+    $("#ext").textContent = (!hasVideo && hasAudio) ? ".mp3" : ".mp4";
+    $("#result").hidden = false;
+  }catch(e){
+    showMsg("请求出错：" + e.message, "err");
+  }finally{
+    $("#go").disabled = false; $("#go").textContent = "提取";
+  }
+}
+
+function renderStreams(d){
+  const box = $("#streams");
+  const rows = [];
+  const viaYtdlp = d.via === "ytdlp";
+
+  if(d.videos && d.videos.length){
+    if(viaYtdlp){
+      d.videos.forEach((v, i) => {
+        rows.push({
+          badge: v.label, hot: i === 0,
+          title: i === 0 ? "最佳画质" : "视频",
+          desc: "视频 + 音频 · 自动合并",
+          payload: {via: "ytdlp", url: d.url, height: v.height || 0}
+        });
+      });
+    } else {
+      const v = d.videos[0];
+      const a = (d.audios && d.audios[0]) || null;
+      rows.push({
+        badge: v.label, hot: true,
+        title: "视频 + 音频",
+        desc: a ? `自动合并音轨（${a.label}）` : "无独立音轨",
+        payload: {video_url: v.url, audio_url: a ? a.url : null,
+                  mp4_url: (d.mp4s && d.mp4s[0]) ? d.mp4s[0].url : null}
+      });
+      d.videos.slice(1).forEach(vv => {
+        rows.push({
+          badge: vv.label, hot: false, title: "视频", desc: "较低画质",
+          payload: {video_url: vv.url, audio_url: a ? a.url : null,
+                    mp4_url: (d.mp4s && d.mp4s[0]) ? d.mp4s[0].url : null}
+        });
+      });
+    }
+  }
+
+  if(d.mp4s && d.mp4s.length){
+    rows.push({
+      badge: "单文件", hot: !rows.length,
+      title: "现成文件",
+      desc: "无需合并，画质较低但兼容性最好",
+      payload: {video_url: null, audio_url: null, mp4_url: d.mp4s[0].url}
+    });
+  }
+
+  if(d.audios && d.audios.length){
+    const a = d.audios[0];
+    const audioOnly = viaYtdlp && !(d.videos && d.videos.length);
+    rows.push({
+      badge: audioOnly ? (a.label === "音频" ? "MP3" : a.label) : "MP3",
+      hot: !rows.length,
+      title: audioOnly ? "音频" : "只要音频",
+      desc: viaYtdlp ? "下载后存为 mp3" : `提取 ${a.label} 音轨并转成 mp3`,
+      payload: viaYtdlp
+        ? {via: "ytdlp", url: d.url, kind: "mp3"}
+        : {audio_url: a.url,
+           mp4_url: (d.mp4s && d.mp4s[0]) ? d.mp4s[0].url : null, kind: "mp3"}
+    });
+  }
+
+  box.innerHTML = rows.map((r, i) => `
+    <div class="stream">
+      <span class="badge ${r.hot ? "hot" : ""}">${esc(r.badge)}</span>
+      <span class="sdesc"><b>${esc(r.title)}</b> · ${esc(r.desc)}</span>
+      <button class="btn primary sm" data-i="${i}">下载</button>
+    </div>`).join("");
+
+  box.querySelectorAll("button[data-i]").forEach(b => {
+    b.onclick = () => startGrab(rows[+b.dataset.i].payload, b);
+  });
+}
+
+async function startGrab(payload, btn){
+  const name = ($("#name").value || "video").replace(/[\\/:*?"<>|]/g, "_").trim();
+  const ext = payload.kind === "mp3" ? ".mp3" : ".mp4";
+  const extEl = $("#ext"); if(extEl) extEl.textContent = ext;
+  btn.disabled = true; btn.textContent = "已加入";
+  const d = await api("/api/grab", {...payload, name});
+  if(d.error){ showMsg(d.error, "err"); btn.disabled = false; btn.textContent = "下载"; return; }
+  $("#tasksCard").hidden = false;
+  addTask(d.id, name, ext);
+  poll(d.id, name);
+}
+
+const TASK_EL = {};
+function addTask(id, name, ext){
+  const div = document.createElement("div");
+  div.className = "task";
+  div.innerHTML = `
+    <div class="tgrow">
+      <div class="tname">${esc(name)}${ext || ".mp4"}</div>
+      <div class="tstage" data-stage>排队中</div>
+      <div class="bar" data-bar><i></i></div>
+    </div>
+    <div class="tend" data-end></div>`;
+  $("#tasks").prepend(div);
+  TASK_EL[id] = div;
+}
+
+function poll(id, name){
+  polling.add(id);
+  const tick = async () => {
+    if(!polling.has(id)) return;
+    try{
+      const r = await fetch("/api/task?id=" + id);
+      const t = await r.json();
+      const el = TASK_EL[id]; if(!el) return;
+      const bar = el.querySelector("[data-bar]");
+      const stg = el.querySelector("[data-stage]");
+      const end = el.querySelector("[data-end]");
+      bar.querySelector("i").style.width = (t.progress || 0) + "%";
+      stg.textContent = t.stage || "";
+
+      if(t.state === "done"){
+        polling.delete(id);
+        bar.classList.add("done");
+        stg.textContent = "已保存";
+        end.textContent = "完成";
+        loadFiles();
+        return;
+      }
+      if(t.state === "error"){
+        polling.delete(id);
+        bar.classList.add("err");
+        end.textContent = "失败"; end.classList.add("bad");
+        stg.textContent = t.stage || "出错";
+        return;
+      }
+      setTimeout(tick, 700);
+    }catch(e){
+      setTimeout(tick, 1500);
+    }
+  };
+  setTimeout(tick, 400);
+}
+
+loadEnv();
+loadFiles();
+loadCookies();
+loadBrowsers();
+loadPlatforms();
+$("#url").focus();
+
+let watchTimer = null;
+let lastClip = "";
+
+async function loadPlatforms(){
+  try{
+    const d = await (await fetch("/api/platforms")).json();
+    const box = $("#pgrid");
+    box.innerHTML = (d.platforms || []).map(p =>
+      `<div class="pitem" data-url="${esc(p.url)}" data-k="${esc(p.key)}" title="打开 ${esc(p.name)}">${esc(p.name)}</div>`
+    ).join("");
+    box.querySelectorAll(".pitem").forEach(el => {
+      el.onclick = async () => {
+        const name = el.textContent.trim();
+        box.querySelectorAll(".pitem").forEach(x => x.classList.remove("on"));
+        el.classList.add("on");
+        // 用系统默认浏览器打开（已有窗口里新开标签页），不另起浏览器
+        const d = await api("/api/open", {url: el.dataset.url});
+        if(d.error){ showMsg(d.error, "err"); el.classList.remove("on"); return; }
+        startWatch(name);
+      };
+    });
+  }catch(e){}
+}
+
+let loginTimer = null;
+function startLoginWatch(key, name){
+  if(loginTimer) clearInterval(loginTimer);
+  let ticks = 0;
+  loginTimer = setInterval(async () => {
+    if(++ticks > 150){ clearInterval(loginTimer); loginTimer = null; return; }
+    try{
+      const d = await (await fetch("/api/connect/status")).json();
+      if(!d.cdp) return;
+      if((d.connected || []).some(x => x.key === key)){
+        clearInterval(loginTimer); loginTimer = null;
+        const r = await api("/api/connect/save", {platform: key});
+        if(r.ok){
+          renderCookies(r.status);
+          showMsg(`${name} 已登录，cookie 已保存（共 ${r.saved} 条）`, "info");
+        }
+      }
+    }catch(e){}
+  }, 2500);
+}
+
+async function startWatch(platformName){
+  if(watchTimer){ clearInterval(watchTimer); watchTimer = null; }
+  try{
+    const d = await (await fetch("/api/clipboard")).json();
+    lastClip = (d.text || "").trim();
+  }catch(e){ lastClip = ""; }
+
+  showMsg(`已打开${platformName || "平台"} · 在那边点「分享 → 复制链接」，这里会自动识别并提取`, "info");
+
+  watchTimer = setInterval(async () => {
+    try{
+      const d = await (await fetch("/api/clipboard")).json();
+      const t = (d.text || "").trim();
+      if(!t || t === lastClip) return;
+      if(!/^https?:\/\/\S+$/i.test(t)) return;
+      lastClip = t;
+      stopWatch();
+      $("#url").value = t;
+      doParse();
+    }catch(e){}
+  }, 1500);
+
+  setTimeout(stopWatch, 180000);
+}
+
+function stopWatch(){
+  if(watchTimer){ clearInterval(watchTimer); watchTimer = null; }
+  document.querySelectorAll(".pitem.on").forEach(x => x.classList.remove("on"));
+}
+
+async function loadCookies(){
+  try{
+    const d = await (await fetch("/api/cookies")).json();
+    renderCookies(d);
+  }catch(e){}
+}
+
+function renderCookies(d){
+  if(!d || !d.platforms) return;
+  $("#cklist").innerHTML = d.platforms.map(p => `
+    <div class="ckrow">
+      <span class="dot ${p.ok ? "on" : ""}"></span>
+      <span class="ckname">${esc(p.name)}</span>
+      <span class="cknote" title="${esc(p.note)}">${esc(p.note)}</span>
+      <span class="ckstate ${p.ok ? "on" : ""}">${p.ok ? "已连接" : "未连接"}</span>
+    </div>`).join("");
+  $("#ckdel").hidden = !d.has_file;
+  $("#ckhint").textContent = d.has_file
+    ? `已载入 ${d.count} 个域名 · ${d.path}`
+    : "还没有 cookies.txt。X、QQ音乐等需要登录的站点，导入后才可用。文件只存在本地。";
+  $("#ckhint").title = d.path || "";
+}
+
+$("#ckimport").onclick = () => $("#ckfile").click();
+
+$("#ckhow").onclick = () => {
+  const g = $("#ckguide");
+  g.hidden = !g.hidden;
+  $("#ckhow").textContent = g.hidden ? "怎么拿？" : "收起";
+};
+
+$("#ckstore").onclick = async () => {
+  try{
+    const d = await api("/api/extension/store", {});
+    if(d.error){ showMsg(d.error, "err"); return; }
+    showMsg("已打开 Chrome 应用商店，点「添加至 Chrome」装好就行。" +
+            "装完打开要下载的网站，点扩展图标 → Export，再回到这里点「导入文件」。", "info");
+  }catch(e){
+    showMsg("打开失败：" + e.message, "err");
+  }
+};
+
+$("#ckext") && ($("#ckext").onclick = async () => {
+  try{
+    const d = await api("/api/extension/open", {});
+    if(d.error){ showMsg(d.error, "err"); return; }
+    let copied = false;
+    if(d.path){
+      try{ await navigator.clipboard.writeText(d.path); copied = true; }catch(e){}
+    }
+    showMsg(
+      "已打开扩展管理页：开启右上角「开发者模式」→ 点「加载已解压的扩展程序」→ " +
+      (copied ? "在地址栏粘贴路径（已复制）" : "选择 " + d.path),
+      "info");
+  }catch(e){
+    showMsg("打开失败：" + e.message, "err");
+  }
+});
+
+$("#ckauto") && ($("#ckauto").onclick = () => doAuto(null, $("#ckauto")));
+
+async function loadBrowsers(){
+  try{
+    const d = await (await fetch("/api/browsers")).json();
+    renderBrowsers(d.browsers || []);
+  }catch(e){}
+}
+
+function renderBrowsers(list){
+  const box = $("#browlist");
+  if(!box) return;
+  if(!list.length){ box.innerHTML = ""; return; }
+  box.innerHTML = list.map(b => {
+    if(!b.installed){
+      return `<div class="ckrow"><span class="dot"></span>
+        <span class="ckname">${esc(b.key)}</span>
+        <span class="cknote">未安装</span></div>`;
+    }
+    const state = b.running ? (b.cdp ? "调试模式" : "普通模式") : "未运行";
+    const tip = b.cdp ? "可以直接读取"
+              : (b.running ? "会重启一次以开启调试端口" : "会启动它并保持开启");
+    return `<div class="ckrow">
+      <span class="dot ${b.running ? "on" : ""}"></span>
+      <span class="ckname">${esc(b.key)}</span>
+      <span class="cknote">${state} · ${tip}</span>
+      <button class="btn ghost sm" data-b="${esc(b.key)}">读取</button>
+    </div>`;
+  }).join("");
+  box.querySelectorAll("button[data-b]").forEach(btn => {
+    btn.onclick = () => doAuto(btn.dataset.b, btn);
+  });
+}
+
+async function doAuto(browser, btn){
+  const name = browser || "Chrome / Edge";
+  const ok = confirm(
+    `使用 ${name} 的已登录状态读取 cookie。\n\n` +
+    `如果 ${name} 正在以普通模式运行，会重启它一次（未保存的网页内容可能丢失）。\n` +
+    `读取完成后浏览器会保持开启，之后不用再重启。\n\n继续吗？`);
+  if(!ok) return;
+  const label = btn ? btn.textContent : "读取";
+  if(btn){ btn.disabled = true; btn.textContent = "读取中…"; }
+  showMsg("正在关闭浏览器并读取 cookie，大约 10~30 秒，页面可能短暂断开…", "info");
+  try{
+    const d = await api("/api/cookies/auto", {browser: browser || null});
+    if(d.error){
+      const n = (d.notes || []).join("；");
+      showMsg(d.error + (n ? " · " + n : "") + (d.hint ? " — " + d.hint : ""), "err");
+      return;
+    }
+    renderCookies(d.status);
+    loadBrowsers();
+    showMsg(`已从 ${d.browser} 获取 ${d.status.count} 个域名的 cookie`, "info");
+  }catch(e){
+    showMsg("获取失败：" + e.message + "（页面如果断过，刷新一下）", "err");
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = label; }
+  }
+}
+
+$("#ckfile").onchange = async e => {
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  try{
+    const text = await f.text();
+    const d = await api("/api/cookies", {content: text});
+    if(d.error){ showMsg(d.error, "err"); return; }
+    renderCookies(d.status);
+    showMsg("已导入并合并，可从下面的状态确认", "info");
+  }catch(err){
+    showMsg("导入失败：" + err.message, "err");
+  }finally{
+    e.target.value = "";
+  }
+};
+
+$("#ckdel").onclick = async () => {
+  const d = await (await fetch("/api/cookies", {method: "DELETE"})).json();
+  if(d.ok){
+    renderCookies(d.status);
+    showMsg("cookies 已移除", "info");
+  } else if(d.error){
+    showMsg(d.error, "err");
+  }
+};
+
+const qs = new URLSearchParams(location.search);
+if(qs.get("url")){
+  $("#url").value = qs.get("url");
+  doParse();
+}
+</script>
+</body>
+</html>

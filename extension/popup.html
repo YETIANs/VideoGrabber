@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+  :root{ --line:#e6e6e9; --muted:#6c6c76; --faint:#9a9aa4; --ok:#0f7a53; --err:#c8322f; }
+  *{box-sizing:border-box}
+  body{
+    width:280px;margin:0;padding:16px;background:#fff;color:#16161a;
+    font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:13px;line-height:1.5;
+  }
+  h1{font-size:14px;font-weight:600;margin:0 0 12px}
+  .host{
+    font-size:12px;color:var(--muted);background:#f7f7f9;border-radius:8px;
+    padding:8px 10px;margin-bottom:12px;word-break:break-all;
+  }
+  .host b{color:#16161a;font-weight:500}
+  button{
+    width:100%;height:38px;border:0;border-radius:9px;background:#16161a;color:#fff;
+    font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;
+  }
+  button:hover:not(:disabled){background:#000}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .msg{margin-top:10px;font-size:12px;line-height:1.6;display:none}
+  .msg.on{display:block}
+  .msg.ok{color:var(--ok)}
+  .msg.err{color:var(--err)}
+  .tip{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);
+    font-size:11.5px;color:var(--faint);line-height:1.6}
+  .tip code{background:#eeeef1;padding:1px 4px;border-radius:3px;font-size:11px}
+</style>
+</head>
+<body>
+  <h1>同步登录状态</h1>
+  <div class="host" id="host">读取中…</div>
+  <button id="go">同步到本地提取器</button>
+  <div class="msg" id="msg"></div>
+  <div class="tip">
+    同步的是<b>当前这个网站</b>的 cookie。多个平台就逐个打开、各点一次。<br>
+    需要本地程序正在运行（<code>127.0.0.1:8765</code>）。
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

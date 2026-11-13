@@ -1,0 +1,30 @@
+# ===== 敏感文件，绝对不要提交 =====
+cookies.txt
+*.pem
+*.key
+config.json
+
+# ===== 构建产物 =====
+dist/
+build/
+*.spec
+installer/
+*.exe
+*.zip
+*.crx
+*.msi
+
+# ===== 运行时生成 =====
+__pycache__/
+*.py[cod]
+downloads/
+.parts/
+browser-profile/
+last_result.html
+
+# ===== 本地调试脚本 =====
+cookie_probe.py
+cdp_probe.py
+login_flow_test.py
+*.log
+ui*.png

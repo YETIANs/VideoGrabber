@@ -1,0 +1,1802 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+server.py — 本地视频提取服务
+================================
+浏览器打开 http://127.0.0.1:8765 ，粘贴链接即可把视频存到本地。
+
+零第三方依赖（标准库 + 本机 ffmpeg）。
+"""
+import hashlib
+import http.server
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+# PyInstaller 打包后：资源在临时解包目录，用户数据要留在 exe 旁边
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    HERE = os.path.dirname(os.path.abspath(sys.executable))
+    RES_DIR = getattr(sys, "_MEIPASS", HERE)
+else:
+    HERE = RES_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_system_dir(p):
+    """装在 Program Files / Windows 下时，数据必须挪走。
+    不能只靠"是否可写"判断——管理员账户对 Program Files 也有写权限。"""
+    if not p:
+        return False
+    try:
+        parts = [x.lower() for x in pathlib.Path(p).parts]
+    except Exception:
+        return False
+    low = "\\".join(parts)
+    return ("program files" in parts
+            or "program files (x86)" in parts
+            or "programdata" in parts
+            or (parts and parts[0].rstrip("\\") == "c:" and "windows" in parts))
+
+
+def _writable(d):
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".wtest")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+# 便携用法：数据放在程序目录；装到系统目录时改用 %LOCALAPPDATA%\VideoGrabber
+if _is_system_dir(HERE) or not _writable(HERE):
+    DATA_DIR = os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "VideoGrabber")
+    os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    DATA_DIR = HERE
+
+DEFAULT_OUT = os.path.join(DATA_DIR, "downloads")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+PORT = 8765
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+# ============================================================ yt-dlp 通道
+# 这些站点强制登录，未登录拿不到媒体地址
+NEED_COOKIE_HOSTS = ("twitter.com", "x.com", "vimeo.com", "instagram.com",
+                     "facebook.com", "fb.watch", "tiktok.com", "twitch.tv",
+                     "y.qq.com",        # QQ 音乐未登录取不到播放地址
+                     "bilibili.com")   # B 站登录后能拿 1080P
+COOKIE_FILE = os.path.join(DATA_DIR, "cookies.txt")
+
+# 需要登录的平台清单（key 对应前端展示顺序）
+COOKIE_PLATFORMS = [
+    ("bilibili", "B站", ("bilibili.com",), "登录后可下 1080P（未登录只有 480P）"),
+    ("x", "X / Twitter", ("x.com", "twitter.com"), "强制登录，否则拿不到视频"),
+    ("qqmusic", "QQ音乐", ("y.qq.com", "qq.com"), "未登录只给试听，取不到播放地址"),
+    ("netease", "网易云音乐", ("music.163.com", "163.com"), "不登录也能下 128k"),
+    ("vimeo", "Vimeo", ("vimeo.com",), "只对登录用户开放"),
+    ("instagram", "Instagram", ("instagram.com",), "部分内容需要登录"),
+    ("douyin", "抖音", ("douyin.com",), "一般不需要，风控时可试"),
+    ("youtube", "YouTube", ("youtube.com",), "一般不需要"),
+]
+
+
+def _read_cookie_domains():
+    """读 cookies.txt 里出现过的域名。"""
+    if not os.path.isfile(COOKIE_FILE):
+        return []
+    out = set()
+    try:
+        with open(COOKIE_FILE, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    out.add(parts[0].lstrip(".").lower())
+    except Exception:
+        pass
+    return sorted(out)
+
+
+def cookie_status():
+    domains = _read_cookie_domains()
+    items = []
+    for key, name, need, note in COOKIE_PLATFORMS:
+        hit = any(any(d == n or d.endswith("." + n) for d in domains) for n in need)
+        items.append({"key": key, "name": name, "ok": hit, "note": note})
+    return {
+        "has_file": os.path.isfile(COOKIE_FILE),
+        "path": COOKIE_FILE,
+        "count": len(domains),
+        "domains": domains[:40],
+        "platforms": items,
+    }
+
+
+def _clean_field(v):
+    """Netscape 格式用 tab 分隔、换行分行，字段里必须去掉这些，
+    否则可以伪造出额外的 cookie 行。"""
+    return (v or "").replace("\t", "").replace("\r", "").replace("\n", "")
+
+
+def _chrome_cookies_to_netscape(items):
+    """浏览器扩展传来的 cookie 数组 → Netscape 格式。"""
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in items:
+        domain = _clean_field(c.get("domain")).strip()
+        name = _clean_field(c.get("name")).strip()
+        if not domain or not name:
+            continue
+        exp = c.get("expirationDate")
+        try:
+            exp = int(float(exp)) if exp else 9999999999
+        except (TypeError, ValueError):
+            exp = 9999999999
+        lines.append("\t".join([
+            domain,
+            "FALSE" if c.get("hostOnly") else "TRUE",
+            _clean_field(c.get("path")) or "/",
+            "TRUE" if c.get("secure") else "FALSE",
+            str(exp), name, _clean_field(c.get("value")),
+        ]))
+    return "\n".join(lines) + "\n"
+
+
+def _valid_cookie_text(text):
+    if "Netscape HTTP Cookie File" in text[:200]:
+        return True
+    for line in text.splitlines():
+        if line.strip() and not line.startswith("#") and line.count("\t") >= 6:
+            return True
+    return False
+
+
+# ---------- 平台快捷入口 ----------
+PLATFORMS = [
+    ("bilibili", "B站", "https://www.bilibili.com", ("bilibili.com", "b23.tv")),
+    ("youtube", "YouTube", "https://www.youtube.com", ("youtube.com", "youtu.be")),
+    ("douyin", "抖音", "https://www.douyin.com", ("douyin.com",)),
+    ("xiaohongshu", "小红书", "https://www.xiaohongshu.com", ("xiaohongshu.com", "xhslink.com")),
+    ("weibo", "微博", "https://weibo.com", ("weibo.com", "weibo.cn")),
+    ("kuaishou", "快手", "https://www.kuaishou.com", ("kuaishou.com",)),
+    ("x", "X", "https://x.com", ("x.com", "twitter.com")),
+    ("tiktok", "TikTok", "https://www.tiktok.com", ("tiktok.com",)),
+    ("netease", "网易云", "https://music.163.com", ("music.163.com",)),
+    ("qqmusic", "QQ音乐", "https://y.qq.com", ("y.qq.com",)),
+    ("instagram", "Instagram", "https://www.instagram.com", ("instagram.com",)),
+    ("vimeo", "Vimeo", "https://vimeo.com", ("vimeo.com",)),
+]
+
+
+# 浏览器商店里的现成导出插件（一键安装，不需要开发者模式）
+EXT_STORE_CHROME = ("https://chromewebstore.google.com/detail/"
+                    "get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc")
+EXT_STORE_EDGE = "https://microsoftedge.microsoft.com/addons/search/cookies.txt"
+EXT_STORE_SEARCH = "https://chromewebstore.google.com/search/cookies.txt"
+
+
+def ensure_extension_dir():
+    """把打包在 exe 里的扩展释放到程序目录旁边，返回路径。"""
+    dst = os.path.join(DATA_DIR, "extension")
+    if os.path.isfile(os.path.join(dst, "manifest.json")):
+        return dst
+    src = os.path.join(RES_DIR, "extension")
+    if not os.path.isfile(os.path.join(src, "manifest.json")):
+        return None
+    try:
+        os.makedirs(dst, exist_ok=True)
+        for fn in ("manifest.json", "popup.html", "popup.js"):
+            s = os.path.join(src, fn)
+            if os.path.isfile(s):
+                shutil.copy2(s, os.path.join(dst, fn))
+        return dst
+    except Exception:
+        return None
+
+
+def open_extension_page():
+    """打开浏览器的扩展管理页，方便用户加载。"""
+    exe = _find_browser_exe("Chrome") or _find_browser_exe("Edge")
+    if not exe:
+        return False
+    try:
+        subprocess.Popen([exe, "chrome://extensions/"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def read_clipboard_text():
+    """读 Windows 剪贴板里的文本。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        CF_UNICODETEXT = 13
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        if not user32.OpenClipboard(None):
+            return None
+        try:
+            h = user32.GetClipboardData(CF_UNICODETEXT)
+            if not h:
+                return None
+            ptr = kernel32.GlobalLock(wintypes.HGLOBAL(h))
+            if not ptr:
+                return None
+            try:
+                return ctypes.wstring_at(ptr)
+            finally:
+                kernel32.GlobalUnlock(wintypes.HGLOBAL(h))
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        return None
+
+
+def open_in_browser(url):
+    """用系统默认浏览器打开。"""
+    try:
+        if sys.platform == "win32":
+            os.startfile(url)          # noqa: S606  (本地工具，链接来自白名单)
+        else:
+            import webbrowser
+            webbrowser.open(url)
+        return True
+    except Exception:
+        return False
+
+
+# ---------- 专用浏览器（cookie 来源）----------
+# Chrome 137+ 禁止在默认用户目录开调试端口，只能用独立目录。
+# 好处是不碰用户日常浏览器，坏处是首次要在里面登录一次。
+BROWSER_PROFILE = os.path.join(DATA_DIR, "browser-profile")
+CDP_PORT = 9333
+
+
+def _cdp_alive():
+    return _cdp_port_ready(CDP_PORT)
+
+
+def ensure_login_browser(url=None):
+    """启动或复用专用浏览器。返回 (ok, message)。"""
+    exe = _find_browser_exe("Chrome") or _find_browser_exe("Edge")
+    if not exe:
+        return False, "没有找到 Chrome 或 Edge"
+
+    if _cdp_alive():
+        if url:
+            _cdp_open_tab(url)
+        return True, None
+
+    os.makedirs(BROWSER_PROFILE, exist_ok=True)
+    args = [exe, f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={BROWSER_PROFILE}",
+            "--no-first-run", "--no-default-browser-check"]
+    args.append(url or "about:blank")
+    try:
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return False, f"启动失败：{e}"
+
+    for _ in range(60):
+        time.sleep(0.4)
+        if _cdp_alive():
+            return True, None
+    return False, "浏览器启动超时"
+
+
+def _cdp_open_tab(url):
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{CDP_PORT}/json/new?{urllib.parse.quote(url, safe='')}",
+            method="PUT")
+        urllib.request.urlopen(req, timeout=5).read()
+        return True
+    except Exception:
+        return False
+
+
+def _platform_domains(key):
+    for k, _n, _u, doms in PLATFORMS:
+        if k == key:
+            return doms
+    return ()
+
+
+def read_browser_cookies():
+    if not _cdp_alive():
+        return []
+    res = _cdp_get_cookies(CDP_PORT)
+    return (res or {}).get("result", {}).get("cookies") or []
+
+
+def connected_platforms(cookies=None):
+    """只有出现真正的登录凭证，才算连上（页面自动设的匿名 cookie 不算）。"""
+    if cookies is None:
+        cookies = read_browser_cookies()
+    names = {(c.get("name") or "", (c.get("domain") or "").lower()) for c in cookies}
+    out = []
+    for key, name, _url, doms in PLATFORMS:
+        want = LOGIN_COOKIE.get(key)
+        if not want:
+            continue
+        hit = any(n == want and any(d in h for d in doms) for n, h in names)
+        if hit:
+            out.append({"key": key, "name": name})
+    return out, len(cookies)
+
+
+# 各平台的登录凭证 cookie 名；没有列出来的平台只能手工判断
+LOGIN_COOKIE = {
+    "bilibili": "SESSDATA",
+    "youtube": "SAPISID",
+    "x": "auth_token",
+    "douyin": "sessionid",
+    "xiaohongshu": "web_session",
+    "weibo": "SUB",
+    "netease": "MUSIC_U",
+    "qqmusic": "qm_keyst",
+    "tiktok": "sessionid",
+    "instagram": "sessionid",
+    "vimeo": "vimeo",
+    "kuaishou": "kuaishou.server.web_st",
+}
+
+
+def save_platform_cookies(key):
+    """把某个平台的 cookie 合并进 cookies.txt。"""
+    cookies = read_browser_cookies()
+    doms = _platform_domains(key)
+    if not doms:
+        return 0
+    subset = [c for c in cookies
+              if any(d in (c.get("domain") or "").lower() for d in doms)]
+    if not subset:
+        return 0
+    text = _cookies_to_netscape(subset)
+    old = ""
+    if os.path.isfile(COOKIE_FILE):
+        with open(COOKIE_FILE, encoding="utf-8", errors="replace") as f:
+            old = f.read()
+    with open(COOKIE_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(_merge_cookie_text(old, text))
+    return len(subset)
+
+
+# ---------- 从浏览器自动取 cookie（走 CDP，绕开 v20 加密） ----------
+BROWSER_EXES = {
+    "Chrome": [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+               r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"],
+    "Edge": [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"],
+}
+
+
+def _find_browser_exe(key):
+    for p in BROWSER_EXES.get(key, []):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _is_running(exe):
+    name = os.path.basename(exe).lower()
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}"],
+                           capture_output=True, text=True, timeout=10,
+                           encoding="utf-8", errors="replace")
+        return name in (r.stdout or "").lower()
+    except Exception:
+        return True
+
+
+def _cdp_port_ready(port):
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def _cdp_get_cookies(port, timeout=20):
+    """通过 CDP 向浏览器要明文 cookie。"""
+    import asyncio
+
+    try:
+        import websockets
+    except Exception:
+        return None
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version",
+                                    timeout=5) as r:
+            ws_url = json.load(r).get("webSocketDebuggerUrl")
+    except Exception:
+        return None
+    if not ws_url:
+        return None
+
+    async def run():
+        async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Storage.getCookies",
+                                      "params": {}}))
+            while True:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+                if msg.get("id") == 1:
+                    return msg
+
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(run())
+    except Exception:
+        return None
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _cookies_to_netscape(cookies):
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        domain = _clean_field(c.get("domain")).strip()
+        name = _clean_field(c.get("name")).strip()
+        if not domain or not name:
+            continue
+        expires = int(c.get("expires") or 0)
+        if expires <= 0:
+            expires = 9999999999
+        lines.append("\t".join([
+            domain,
+            "TRUE" if domain.startswith(".") else "FALSE",
+            _clean_field(c.get("path")) or "/",
+            "TRUE" if c.get("secure") else "FALSE",
+            str(expires), name, _clean_field(c.get("value")),
+        ]))
+    return "\n".join(lines) + "\n"
+
+
+def browser_status():
+    """当前各浏览器的状态，给界面先展示再决定操作。"""
+    out = []
+    for key in ("Chrome", "Edge"):
+        exe = _find_browser_exe(key)
+        if not exe:
+            out.append({"key": key, "installed": False, "running": False,
+                        "cdp": False, "path": ""})
+            continue
+        port = 9333 if key == "Chrome" else 9334
+        out.append({"key": key, "installed": True,
+                    "running": _is_running(exe),
+                    "cdp": _cdp_port_ready(port),
+                    "path": exe})
+    return out
+
+
+def auto_grab_cookies(reopen_url=None, use_headless=False, only=None):
+    """用浏览器自己的默认 profile 读 cookie。
+
+    关键点：
+      1. Chrome 127+ 的 cookie 用 App-Bound 加密锁死，离线解不开，
+         只能让浏览器自己开调试端口读，所以浏览器要以调试模式启动一次。
+      2. 启动后必须等页面真正加载完再读，否则 cookie 还没从磁盘载入，
+         读到的是空列表。
+      3. 读完**不关闭浏览器**，留着继续用；下次再点就能直接读，不用重启。
+    """
+    notes = []
+    order = (only,) if only else ("Chrome", "Edge")
+    for key in order:
+        exe = _find_browser_exe(key)
+        if not exe:
+            notes.append(f"{key} 未安装")
+            continue
+
+        port = 9333 if key == "Chrome" else 9334
+        running = _is_running(exe)
+        cdp = _cdp_port_ready(port)
+
+        try:
+            if running and cdp:
+                # 已经是调试模式，直接读
+                notes.append(f"{key} 已在调试模式")
+            else:
+                if running:
+                    # 普通模式启动的，只能重启一次才能开调试端口
+                    subprocess.run(["taskkill", "/IM", os.path.basename(exe), "/F"],
+                                   capture_output=True, timeout=20)
+                    for _ in range(24):
+                        time.sleep(0.5)
+                        if not _is_running(exe):
+                            break
+                    else:
+                        notes.append(f"{key} 关不掉")
+                        continue
+                args = [exe, f"--remote-debugging-port={port}",
+                        "--no-first-run", "--no-default-browser-check",
+                        "--restore-last-session"]
+                subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                ok = False
+                for _ in range(60):
+                    time.sleep(0.4)
+                    if _cdp_port_ready(port):
+                        ok = True
+                        break
+                if not ok:
+                    notes.append(f"{key} 调试端口没起来")
+                    continue
+                # 等页面把 cookie 从磁盘载进来，太急会读到空
+                time.sleep(6)
+
+            res = None
+            for attempt in range(4):
+                res = _cdp_get_cookies(port)
+                cookies = (res or {}).get("result", {}).get("cookies") or []
+                if cookies:
+                    return _cookies_to_netscape(cookies), key, notes
+                time.sleep(2.5)
+
+            notes.append(f"{key} 里没有 cookie（可能没登录过任何账号）")
+
+        except Exception as e:
+            notes.append(f"{key} 出错：{str(e)[:60]}")
+        # 注意：无论成功失败都不 taskkill，浏览器留着继续用
+    return None, None, notes
+
+
+def _is_internal_host(host):
+    """内网 / 回环 / 保留地址：不让服务去请求它们（防 SSRF）。"""
+    h = (host or "").lower().strip("[]")
+    if not h:
+        return True
+    if h in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _url_allowed(url):
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    return not _is_internal_host(p.hostname)
+
+
+def unique_base(out, name):
+    """同名文件不覆盖，自动加 (2)(3)。"""
+    exts = ("mp4", "mkv", "webm", "mp3", "m4a", "mov", "flv")
+
+    def taken(n):
+        return any(os.path.exists(os.path.join(out, f"{n}.{e}")) for e in exts)
+
+    if not taken(name):
+        return name
+    i = 2
+    while taken(f"{name} ({i})"):
+        i += 1
+    return f"{name} ({i})"
+
+
+def _merge_cookie_text(old, new):
+    """把新导出的 cookie 合并进已有文件，同 (域名,路径,名) 覆盖，其余保留。
+    这样可以一个平台一个平台地导，不用自己拼文件。"""
+    def parse(text):
+        rows = {}
+        for line in (text or "").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split("\t")
+            if len(parts) >= 7:
+                rows[(parts[0], parts[2], parts[5])] = s
+        return rows
+
+    merged = parse(old)
+    merged.update(parse(new))
+    lines = ["# Netscape HTTP Cookie File"]
+    lines += [merged[k] for k in merged]
+    return "\n".join(lines) + "\n"
+
+
+def _need_cookie(url):
+    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    return any(k in host for k in NEED_COOKIE_HOSTS)
+
+
+def _cookie_variants(url):
+    """按优先级给出几组 cookie 配置：本地 cookies.txt → 浏览器 → 不带。"""
+    if not _need_cookie(url):
+        return [{}]
+    out = []
+    if os.path.isfile(COOKIE_FILE):
+        out.append({"cookiefile": COOKIE_FILE})
+    for br in ("chrome", "edge", "firefox"):
+        out.append({"cookiesfrombrowser": (br,)})
+    out.append({})
+    return out
+
+
+def _ytdlp_available():
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+# 这些域名直连更快也更稳，绕代理反而容易被判异常
+DOMESTIC_HOSTS = ("163.com", "bilibili", "douyin", "kuaishou", "xiaohongshu",
+                  "kuwo", "qq.com", "kugou", "iqiyi", "youku", "weibo",
+                  "zhihu", "acgvideo", "hdslb", "b23.tv")
+
+
+def ytdlp_probe(url, timeout=45):
+    """用 yt-dlp 取元数据（不下文件）。超时返回 None，交给下一条通道。"""
+    if not _ytdlp_available():
+        return None
+    box = {}
+
+    def run():
+        import yt_dlp
+        base = {"quiet": True, "no_warnings": True, "skip_download": True,
+                "noplaylist": True, "socket_timeout": 15, "nocheckcertificate": True}
+        for extra in _cookie_variants(url):
+            opts = dict(base)
+            opts.update(extra)
+            try:
+                with yt_dlp.YoutubeDL(opts) as y:
+                    info = y.extract_info(url, download=False)
+                if info:
+                    box["info"] = info
+                    return
+            except Exception:
+                continue
+        box["info"] = None
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return None
+
+    info = box.get("info")
+    if not info:
+        return None
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            return None
+        info = entries[0]
+    return info
+
+
+def ytdlp_options(info):
+    """把 yt-dlp 的 formats 压成几档画质选项。纯音频站直接给一条音频。"""
+    formats = info.get("formats") or []
+    heights = set()
+    has_audio = False
+    for f in formats:
+        if f.get("acodec") not in (None, "none"):
+            has_audio = True
+        if f.get("vcodec") in (None, "none"):
+            continue
+        h = f.get("height")
+        if h:
+            heights.add(int(h))
+
+    # 没有任何视频轨 = 纯音频站（网易云 / SoundCloud 等）
+    if not heights:
+        abr = info.get("abr") or 0
+        try:
+            abr = int(float(abr))
+        except (TypeError, ValueError):
+            abr = 0
+        label = f"{abr}K" if abr else "音频"
+        return [], [{"label": label, "qn": 0, "via": "ytdlp", "url": ""}]
+
+    hs = sorted(heights, reverse=True)[:4]
+    videos = [{"label": f"{h}P", "height": h, "qn": 0, "via": "ytdlp", "url": ""}
+              for h in hs]
+    audios = [{"label": "音频", "qn": 0, "via": "ytdlp", "url": ""}] if has_audio else []
+    return videos, audios
+
+
+def run_ytdlp_job(tid, url, name, kind, height):
+    out = load_out()
+    parts = os.path.join(out, ".parts")
+    try:
+        import yt_dlp
+        os.makedirs(out, exist_ok=True)
+        name = unique_base(out, name)
+        ff = find_ffmpeg()
+
+        def hook(d):
+            st = d.get("status")
+            if st == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                done = d.get("downloaded_bytes") or 0
+                pct = int(done * 90 / total) if total else 0
+                set_task(tid, state="downloading", progress=max(0, min(pct, 90)),
+                         stage="下载中")
+            elif st == "finished":
+                set_task(tid, progress=92, stage="合并中")
+
+        parts = os.path.join(out, ".parts")
+        os.makedirs(parts, exist_ok=True)
+
+        opts = {
+            "quiet": True, "no_warnings": True, "noplaylist": True,
+            "noprogress": True,
+            # 分片和 .part 全部落在 .parts 里，下完才移动到目标目录，
+            # 避免用户在下载目录里看到 xxx.f137.mp4.part 这种半成品
+            # 换成 unique_base 时也把 % 转义，否则 yt-dlp 会当模板变量解析
+            "outtmpl": name.replace("%", "%%") + ".%(ext)s",
+            "paths": {"home": out, "temp": parts},
+            "overwrites": True,
+            "progress_hooks": [hook],
+            "retries": 5,
+            "fragment_retries": 5,
+            "nocheckcertificate": True,
+        }
+        if ff:
+            opts["ffmpeg_location"] = os.path.dirname(ff)
+
+        # 国内站点直连：走系统代理常被 CDN 判成异常流量（403）
+        host = (urllib.parse.urlparse(url).netloc or "").lower()
+        if any(k in host for k in DOMESTIC_HOSTS):
+            opts["proxy"] = ""
+
+        if kind == "mp3":
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3", "preferredquality": "192"}]
+            want = ("mp3",)
+        else:
+            h = f"[height<={height}]" if height else ""
+            # 优先 H.264 + AAC：AV1/VP9 在 Windows 自带播放器里经常打不开
+            opts["format"] = (
+                f"bv*[vcodec^=avc1]{h}+ba[acodec^=mp4a]/"
+                f"bv*[vcodec^=avc]{h}+ba/"
+                f"bv*{h}+ba/"
+                f"b{h}/best")
+            opts["merge_output_format"] = "mp4"
+            want = ("mp4", "mkv", "webm")
+
+        set_task(tid, state="downloading", stage="准备中", progress=0)
+
+        # 需要登录的站点轮换 cookie 来源；其余站点只有一个空配置
+        variants = _cookie_variants(url)
+        err = None
+        tries = max(3, len(variants))
+        for attempt in range(tries):
+            o = dict(opts)
+            o.update(variants[attempt % len(variants)])
+            try:
+                with yt_dlp.YoutubeDL(o) as y:
+                    y.download([url])
+                err = None
+                break
+            except Exception as e:
+                err = e
+                msg = str(e)
+                if attempt < tries - 1 and ("403" in msg or "Forbidden" in msg
+                                            or "timed out" in msg or "429" in msg
+                                            or "login" in msg.lower()
+                                            or "cookie" in msg.lower()):
+                    set_task(tid, stage=f"重试 {attempt + 2}/{tries}", progress=3)
+                    time.sleep(3 + attempt * 3)
+                    continue
+                break
+        if err:
+            raise err
+
+        for ext in want:
+            p = os.path.join(out, f"{name}.{ext}")
+            if os.path.exists(p):
+                set_task(tid, state="done", progress=100, stage="完成",
+                         file=os.path.basename(p))
+                return
+        raise RuntimeError("下载结束但没找到输出文件")
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200])
+    finally:
+        # 失败或中断时清掉半成品，别留在磁盘上
+        try:
+            if os.path.isdir(parts):
+                for fn in os.listdir(parts):
+                    if fn.startswith(name + "."):
+                        os.remove(os.path.join(parts, fn))
+        except Exception:
+            pass
+        _clean_parts(parts)
+
+
+# ============================================================ 取标题
+_TITLE_CACHE = {}
+
+
+def _http_text(url, referer=None, timeout=8, opener=None):
+    h = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"}
+    if referer:
+        h["Referer"] = referer
+    req = urllib.request.Request(url, headers=h)
+    op = opener or urllib.request.build_opener()
+    return op.open(req, timeout=timeout).read().decode("utf-8", "replace")
+
+
+def bili_title(bvid):
+    """B 站标题：必须先访问首页拿 buvid3 cookie，否则接口返回风控页。"""
+    import http.cookiejar
+    cj = http.cookiejar.CookieJar()
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    try:
+        _http_text("https://www.bilibili.com/", timeout=8, opener=op)
+    except Exception:
+        pass
+    raw = _http_text(
+        f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+        referer="https://www.bilibili.com/", timeout=8, opener=op)
+    d = json.loads(raw)
+    if d.get("code") != 0:
+        return None
+    v = d.get("data") or {}
+    return (v.get("title") or "").strip() or None
+
+
+def page_title(url):
+    """通用兜底：读网页 <title>，去掉站点后缀。"""
+    try:
+        html = _http_text(url, timeout=8)
+    except Exception:
+        return None
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    if not m:
+        return None
+    t = re.sub(r"\s+", " ", m.group(1)).strip()
+    for suf in ("_哔哩哔哩_bilibili", "-抖音", "- 抖音", " - 小红书", "_小红书"):
+        t = t.replace(suf, "")
+    t = t.strip(" -_|·")
+    return t if len(t) >= 3 and not re.fullmatch(r"(抖音|小红书|哔哩哔哩|bilibili)", t) else None
+
+
+def fetch_title(url):
+    """按链接猜出视频标题；拿不到返回 None。"""
+    key = url
+    if key in _TITLE_CACHE:
+        return _TITLE_CACHE[key]
+    title = None
+    try:
+        m = re.search(r"(BV[0-9A-Za-z]{10})", url)
+        if m:
+            title = bili_title(m.group(1))
+        if not title:
+            title = page_title(url)
+    except Exception:
+        title = None
+    _TITLE_CACHE[key] = title
+    return title
+
+
+# ---- 保存目录配置 ----
+def load_out():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            p = (json.load(f) or {}).get("out")
+        if p and os.path.isdir(p):
+            return p
+    except Exception:
+        pass
+    return DEFAULT_OUT
+
+
+def save_out(path):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"out": path}, f, ensure_ascii=False, indent=2)
+
+
+def common_places():
+    home = os.path.expanduser("~")
+    cands = [
+        ("桌面", os.path.join(home, "Desktop")),
+        ("下载", os.path.join(home, "Downloads")),
+        ("视频", os.path.join(home, "Videos")),
+        ("C 盘", "C:\\"),
+        ("D 盘", "D:\\"),
+        ("E 盘", "E:\\"),
+    ]
+    return [{"name": n, "path": p} for n, p in cands if os.path.isdir(p)]
+
+
+def pick_dir_dialog():
+    """弹 Windows 原生文件夹选择框。不依赖 tkinter（精简版 Python 常缺）。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        BIF_RETURNONLYFSDIRS = 0x0001
+        BIF_EDITBOX = 0x0010
+        BIF_NEWDIALOGSTYLE = 0x0040
+
+        class BROWSEINFO(ctypes.Structure):
+            _fields_ = [
+                ("hwndOwner", wintypes.HWND),
+                ("pidlRoot", ctypes.c_void_p),
+                ("pszDisplayName", ctypes.c_void_p),
+                ("lpszTitle", wintypes.LPCWSTR),
+                ("ulFlags", wintypes.UINT),
+                ("lpfn", ctypes.c_void_p),
+                ("lParam", wintypes.LPARAM),
+                ("iImage", ctypes.c_int),
+            ]
+
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+        shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+        shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFO)]
+        shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+        shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+
+        ole32.CoInitialize(None)
+        display = ctypes.create_unicode_buffer(260)
+        bi = BROWSEINFO()
+        bi.hwndOwner = ctypes.windll.kernel32.GetConsoleWindow() or None
+        bi.pszDisplayName = ctypes.addressof(display)
+        bi.lpszTitle = "选择视频保存位置"
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_EDITBOX | BIF_NEWDIALOGSTYLE
+
+        pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+        if not pidl:
+            return None
+        path = ctypes.create_unicode_buffer(260)
+        ok = shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), path)
+        ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+        return path.value if ok else None
+    except Exception:
+        return None
+
+
+# ---- 解析端（逆向得到的签名算法，仅用于取回媒体地址）----
+API_BASE = "https://www.xtdowner.com"
+SALT_INNER = "XAZDZD"
+SALT_OUTER = "XTv2"
+
+TASKS = {}
+LOCK = threading.Lock()
+AUTO_LOCK = threading.Lock()
+
+
+# ============================================================ 签名 / 解析
+def make_sign(s, now_ms=None):
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    tag = f"{now_ms & 0xFF:02x}"
+    inner = hashlib.md5((s + tag + "C" + SALT_INNER).encode()).hexdigest()
+    outer = hashlib.sha256((SALT_OUTER + inner + SALT_INNER).encode()).hexdigest()
+    return "xtdo_" + tag + outer[16:]
+
+
+def enc(s):
+    return urllib.parse.quote(s, safe="!'()*-._~")
+
+
+class Resolver:
+    def __init__(self):
+        import http.cookiejar
+        self.cj = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cj))
+
+    def _headers(self):
+        return {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"}
+
+    def _csrf(self):
+        req = urllib.request.Request(f"{API_BASE}/video/", headers=self._headers())
+        page = self.opener.open(req, timeout=60).read().decode("utf-8", "replace")
+        m = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page)
+        if not m:
+            raise RuntimeError("初始化失败")
+        return m.group(1)
+
+    def _post(self, data):
+        req = urllib.request.Request(
+            f"{API_BASE}/video/", data=urllib.parse.urlencode(data).encode(),
+            headers={**self._headers(), "Referer": f"{API_BASE}/video/",
+                     "Origin": API_BASE,
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            return self.opener.open(req, timeout=90).read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.read().decode("utf-8", "replace")
+
+    def resolve(self, url):
+        tok = self._csrf()
+        page = self._post({"csrfmiddlewaretoken": tok, "detail": url,
+                           "platform": "video",
+                           "sign": make_sign(enc("xtdowner_" + url))})
+        m = re.search(r'name="dyid" value="([^"]+)"', page)
+        if m:
+            import html as h
+            dyid = h.unescape(m.group(1))
+            t2 = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page)
+            page = self._post({"csrfmiddlewaretoken": t2.group(1) if t2 else tok,
+                               "dyid": dyid,
+                               "sign": make_sign(enc("xtdowner_" + dyid))})
+
+        import html as h
+        clean = h.unescape(page)
+        links, seen = [], set()
+        for mm in re.finditer(
+                r'https?://[^"\'\s<>]+?\.(?:mp4|m4s|mp3|m4a)(?:\?[^"\'\s<>]*)?', clean):
+            u = mm.group(0).replace("&amp;", "&")
+            if u not in seen:
+                seen.add(u)
+                links.append(u)
+        return links
+
+
+# B 站画质代号 → 人话
+QN_LABEL = {30011: "360P", 30032: "480P", 30064: "720P", 30080: "1080P",
+            30112: "1080P+", 30116: "1080P60", 30120: "4K", 30121: "8K",
+            30216: "64K", 30232: "132K", 30280: "192K", 30300: "杜比"}
+
+
+# 从任意文本里捞出链接：兼容“整段分享文案”“无协议头域名”“全角标点包裹”
+_URL_RE = re.compile(r'https?://[^\s<>"\'，。；、！？）】》」』]+', re.I)
+_BARE_RE = re.compile(
+    r'(?:[a-z0-9][a-z0-9-]*\.)+[a-z]{2,}(?::\d+)?'
+    r'(?:/[^\s<>"\'，。；、！？）】》」』]*)?', re.I)
+
+
+def extract_url(raw):
+    """返回 (归一化链接 or None, 是否做过提取)。"""
+    s = (raw or "").replace("\u200b", "").replace("\ufeff", "").strip()
+    m = _URL_RE.search(s)
+    if m:
+        u = m.group(0).rstrip(".,;:!?")
+        return u, u != s
+    m = _BARE_RE.search(s)
+    if m:
+        u = "https://" + m.group(0).rstrip(".,;:!?")
+        return u, True
+    return None, False
+
+
+SHORT_HOSTS = ("b23.tv", "v.douyin.com", "xhslink.com", "t.cn", "dwz.cn",
+               "v.kuaishou.com", "url.cn", "suo.im")
+
+
+def expand_short(url, timeout=8):
+    """短链先跟一次跳转拿真实地址；失败就原样返回，不影响主流程。"""
+    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    if not any(h in host for h in SHORT_HOSTS):
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            final = r.geturl()
+        return final if final and final != url else None
+    except Exception:
+        return None
+
+
+def classify(links):
+    videos, audios, mp4s = [], [], []
+    for u in links:
+        path = u.split("?")[0]
+        if path.endswith(".mp4"):
+            mp4s.append({"url": u, "label": "单文件", "qn": 0})
+            continue
+        m = re.search(r"-(\d+)\.m4s$", path)
+        qn = int(m.group(1)) if m else 0
+        item = {"url": u, "qn": qn, "label": QN_LABEL.get(qn, str(qn) if qn else "流")}
+        if qn >= 30200:
+            audios.append(item)
+        elif path.endswith((".mp3", ".m4a")):
+            audios.append(item)
+        else:
+            videos.append(item)
+    videos.sort(key=lambda x: -x["qn"])
+    audios.sort(key=lambda x: -x["qn"])
+    return videos, audios, mp4s
+
+
+# ============================================================ 下载
+def cdn_headers(url):
+    host = (urllib.parse.urlparse(url).netloc or "").lower()
+    if "bilivideo" in host or "bilibili" in host:
+        ref = "https://www.bilibili.com/"
+    elif "douyin" in host or "bytecdn" in host or "zjcdn" in host:
+        ref = "https://www.douyin.com/"
+    elif "xhscdn" in host or "xiaohongshu" in host:
+        ref = "https://www.xiaohongshu.com/"
+    else:
+        ref = f"https://{host}/"
+    return {"User-Agent": UA, "Referer": ref, "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9", "Origin": ref.rstrip("/")}
+
+
+def find_ffmpeg():
+    # 1) exe 旁边 bin\ffmpeg.exe（用户可自行替换版本）
+    local = os.path.join(HERE, "bin", "ffmpeg.exe")
+    if os.path.isfile(local):
+        return local
+    # 2) 打包进 exe 的（PyInstaller 解到临时目录）
+    bundled = os.path.join(RES_DIR, "ffmpeg.exe")
+    if os.path.isfile(bundled):
+        return bundled
+    # 3) 系统里现有的
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    for p in (r"E:\ffmpeg\bin\ffmpeg.exe", r"C:\ffmpeg\bin\ffmpeg.exe"):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def save_stream(url, dest, on_progress=None):
+    req = urllib.request.Request(url, headers=cdn_headers(url))
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        while True:
+            chunk = r.read(262144)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            if on_progress:
+                on_progress(got, total)
+
+
+def set_task(tid, **kw):
+    with LOCK:
+        TASKS.setdefault(tid, {}).update(kw)
+        # 任务记录不清会一直涨，超量就把已结束的丢掉
+        if len(TASKS) > 300:
+            for k in [k for k, v in TASKS.items()
+                      if v.get("state") in ("done", "error")]:
+                TASKS.pop(k, None)
+                if len(TASKS) <= 200:
+                    break
+
+
+def _clean_parts(parts):
+    """临时目录空了就删掉，别在下载目录留一个空文件夹。"""
+    try:
+        if os.path.isdir(parts) and not os.listdir(parts):
+            os.rmdir(parts)
+    except Exception:
+        pass
+
+
+def run_job(tid, video_url, audio_url, mp4_url, name, kind="video"):
+    out = load_out()
+    parts = os.path.join(out, ".parts")
+    try:
+        os.makedirs(parts, exist_ok=True)
+        name = unique_base(out, name)
+        ffmpeg = find_ffmpeg()
+
+        # ---- 仅音频（mp3）----
+        if kind == "mp3":
+            src = audio_url or mp4_url
+            if not src:
+                raise RuntimeError("这条链接没有可提取的音轨")
+            set_task(tid, state="downloading", stage="下载音频", progress=0)
+            tmp = os.path.join(parts, f"{tid}.src")
+            save_stream(src, tmp, lambda g, t: set_task(
+                tid, progress=int(g * 80 / t) if t else 0))
+
+            if ffmpeg:
+                set_task(tid, stage="转码 MP3", progress=85)
+                final = os.path.join(out, name + ".mp3")
+                r = subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error", "-i", tmp, "-vn",
+                     "-c:a", "libmp3lame", "-q:a", "2", final],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+                os.remove(tmp)
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or "转码失败")[-300:])
+            else:
+                # 没有 ffmpeg 就保留原始 AAC 容器，照样能播放
+                final = os.path.join(out, name + ".m4a")
+                os.replace(tmp, final)
+
+            set_task(tid, state="done", progress=100, stage="完成",
+                     file=os.path.basename(final))
+            return
+
+        final = os.path.join(out, name + ".mp4")
+
+        if mp4_url and (not video_url or not ffmpeg):
+            set_task(tid, state="downloading", stage="下载中", progress=0)
+            tmp = os.path.join(parts, f"{tid}.mp4")
+            save_stream(mp4_url, tmp, lambda g, t: set_task(
+                tid, progress=int(g * 100 / t) if t else 0))
+            os.replace(tmp, final)
+            set_task(tid, state="done", progress=100, stage="完成",
+                     file=os.path.basename(final))
+            return
+
+        vtmp = os.path.join(parts, f"{tid}.v")
+        atmp = os.path.join(parts, f"{tid}.a")
+
+        set_task(tid, state="downloading", stage="下载视频", progress=0)
+        save_stream(video_url, vtmp, lambda g, t: set_task(
+            tid, progress=int(g * 45 / t) if t else 0))
+
+        if audio_url:
+            set_task(tid, stage="下载音频", progress=45)
+            save_stream(audio_url, atmp, lambda g, t: set_task(
+                tid, progress=45 + (int(g * 45 / t) if t else 0)))
+
+        set_task(tid, stage="合并", progress=90)
+        cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", vtmp]
+        if audio_url:
+            cmd += ["-i", atmp]
+        cmd += ["-c", "copy", final]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        for f in (vtmp, atmp):
+            if os.path.exists(f):
+                os.remove(f)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or "合并失败")[-300:])
+
+        set_task(tid, state="done", progress=100, stage="完成",
+                 file=os.path.basename(final))
+
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200])
+    finally:
+        _clean_parts(parts)
+
+
+# ============================================================ 双通道解析
+# 国内平台先走原解析站（画质更稳），其余先走 yt-dlp（覆盖面广）
+SITE_FIRST = ("bilibili", "b23.tv", "douyin", "iesdouyin", "xiaohongshu",
+              "xhslink", "weibo", "kuaishou", "ixigua", "iqiyi", "youku",
+              "v.qq.com", "douban", "zhihu", "toutiao")
+
+
+def parse_via_site(url, extracted):
+    try:
+        links = Resolver().resolve(url)
+    except Exception:
+        links = []
+    if not links:
+        real = expand_short(url)
+        if real:
+            try:
+                links = Resolver().resolve(real)
+                url = real
+            except Exception:
+                links = []
+    if not links:
+        return None
+    videos, audios, mp4s = classify(links)
+    title = fetch_title(url)
+    return {"ok": True, "url": url, "extracted": extracted, "via": "site",
+            "title": title or "", "videos": videos, "audios": audios,
+            "mp4s": mp4s,
+            "suggest": safe_name(title) if title else suggest_name(url),
+            "best": (videos[0]["label"] if videos else
+                     (mp4s[0]["label"] if mp4s else "未知"))}
+
+
+def parse_via_ytdlp(url, extracted):
+    info = ytdlp_probe(url)
+    if not info:
+        return None
+    vids, auds = ytdlp_options(info)
+    title = (info.get("title") or "").strip() or None
+    return {"ok": True, "url": url, "extracted": extracted, "via": "ytdlp",
+            "title": title or "", "videos": vids, "audios": auds, "mp4s": [],
+            "suggest": safe_name(title) if title else suggest_name(url),
+            "best": vids[0]["label"] if vids else "未知"}
+
+
+def _has_cookie_for(domain):
+    return any(domain in d for d in _read_cookie_domains())
+
+
+def _label_num(label):
+    m = re.match(r"(\d+)", str(label or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _pick_better(a, b):
+    """两条通道都有结果时，选最高画质更高的那个。"""
+    if not a:
+        return b
+    if not b:
+        return a
+    ha = max([_label_num(v.get("label")) for v in (a.get("videos") or [])] or [0])
+    hb = max([_label_num(v.get("label")) for v in (b.get("videos") or [])] or [0])
+    return a if ha >= hb else b
+
+
+# ============================================================ HTTP
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _file(self, path, name=None, mime="application/octet-stream"):
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(size))
+        if name:
+            self.send_header(
+                "Content-Disposition",
+                "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(262144)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def _same_origin(self):
+        """挡住其它网页对本服务的跨站请求（CSRF）。
+        浏览器跨站 POST 一定会带 Origin，比对 Host 即可。
+        自家扩展（chrome-extension://）放行。"""
+        host = (self.headers.get("Host") or "").lower()
+        org = (self.headers.get("Origin") or "")
+        if org.startswith(("chrome-extension://", "moz-extension://")):
+            return True
+        for hdr in ("Origin", "Referer"):
+            v = self.headers.get(hdr)
+            if not v:
+                continue
+            try:
+                netloc = urllib.parse.urlparse(v).netloc.lower()
+            except Exception:
+                return False
+            if netloc and netloc != host:
+                return False
+        return True
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(p.query)
+
+        if p.path in ("/", "/index.html"):
+            html = os.path.join(RES_DIR, "index.html")
+            return self._file(html, None, "text/html; charset=utf-8")
+
+        if p.path == "/api/env":
+            return self._json({"ffmpeg": bool(find_ffmpeg()), "out": load_out(),
+                               "default": DEFAULT_OUT,
+                               "places": common_places()})
+
+        if p.path == "/api/pick-dir":
+            # 对话框只能在有桌面会话的进程里弹；无桌面时会永久阻塞，所以加超时。
+            box = {}
+            t = threading.Thread(target=lambda: box.update(p=pick_dir_dialog()),
+                                 daemon=True)
+            t.start()
+            t.join(75)
+            if t.is_alive():
+                return self._json({"ok": False,
+                                   "hint": "选择框没响应，直接在输入框里改路径就行"})
+            pth = box.get("p")
+            if not pth:
+                return self._json({"ok": False,
+                                   "hint": "已取消，或在输入框里直接改路径"})
+            try:
+                os.makedirs(pth, exist_ok=True)
+            except Exception as e:
+                return self._json({"ok": False, "error": f"目录不可用：{e}"})
+            save_out(pth)
+            return self._json({"ok": True, "out": pth})
+
+        if p.path == "/api/cookies":
+            return self._json(cookie_status())
+
+        if p.path == "/api/extension":
+            path = ensure_extension_dir()
+            return self._json({"ok": bool(path), "path": path or ""})
+
+        if p.path == "/api/platforms":
+            return self._json({"platforms": [
+                {"key": k, "name": n, "url": u} for k, n, u, _ in PLATFORMS]})
+
+        if p.path == "/api/clipboard":
+            return self._json({"text": read_clipboard_text() or ""})
+
+        if p.path == "/api/browsers":
+            return self._json({"browsers": browser_status()})
+
+        if p.path == "/api/connect/status":
+            logged, total = connected_platforms()
+            return self._json({"cdp": _cdp_alive(), "total": total,
+                               "connected": logged})
+
+        if p.path == "/api/files":
+            out = load_out()
+            os.makedirs(out, exist_ok=True)
+            items = []
+            for fn in os.listdir(out):
+                if fn.startswith(".") or not fn.endswith((".mp4", ".m4s", ".mp3", ".m4a")):
+                    continue
+                fp = os.path.join(out, fn)
+                try:
+                    items.append({"name": fn, "size": os.path.getsize(fp),
+                                  "mtime": int(os.path.getmtime(fp))})
+                except OSError:
+                    pass
+            items.sort(key=lambda x: -x["mtime"])
+            return self._json({"files": items, "out": out})
+
+        if p.path == "/api/task":
+            tid = (q.get("id") or [""])[0]
+            with LOCK:
+                t = dict(TASKS.get(tid) or {})
+            if not t:
+                return self._json({"error": "not found"}, 404)
+            return self._json(t)
+
+        if p.path == "/file":
+            fn = os.path.basename((q.get("n") or [""])[0])
+            fp = os.path.join(load_out(), fn)
+            if not os.path.isfile(fp):
+                return self._json({"error": "not found"}, 404)
+            return self._file(fp, fn)
+
+        return self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        if not self._same_origin():
+            return self._json({"error": "blocked: cross-origin request"}, 403)
+        # 浏览器跨站请求若用 text/plain 可绕过 CORS 预检，这里强制要求 JSON
+        if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+            return self._json({"error": "content-type must be application/json"}, 415)
+        p = urllib.parse.urlparse(self.path)
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._json({"error": "bad json"}, 400)
+
+        if p.path == "/api/parse":
+            raw = (body.get("url") or "").strip()
+            if not raw:
+                return self._json({"error": "先贴个链接"}, 400)
+            url, extracted = extract_url(raw)
+            if not url:
+                return self._json(
+                    {"error": "没认出链接。整段分享文字直接贴进来就行，我会自己找。"}, 400)
+            if not _url_allowed(url):
+                return self._json(
+                    {"error": "只接受公开的 http/https 链接，内网地址不能解析"}, 400)
+
+            # 按域名决定先用哪条通道
+            host = (urllib.parse.urlparse(url).netloc or "").lower()
+            site_first = any(k in host for k in SITE_FIRST)
+
+            if site_first:
+                result = parse_via_site(url, extracted) or parse_via_ytdlp(url, extracted)
+                # B 站登录态下 yt-dlp 能给 1080P，解析站固定 480P。
+                # 只有在 cookies.txt 里真有 bilibili 时才多跑一次 yt-dlp，取高的。
+                if "bilibili" in host and _has_cookie_for("bilibili.com"):
+                    alt = parse_via_ytdlp(url, extracted)
+                    result = _pick_better(result, alt)
+            else:
+                result = parse_via_ytdlp(url, extracted) or parse_via_site(url, extracted)
+
+            if not result:
+                if _need_cookie(url):
+                    return self._json({
+                        "error": "这个站点要登录才能取到视频。用浏览器扩展导出 cookies.txt "
+                                 "放到程序目录（和 server.py 同一层）再试。"
+                    }, 200)
+                return self._json(
+                    {"error": "这个链接没解析出可下载的内容，换个链接试试"}, 200)
+            return self._json(result)
+        if p.path == "/api/cookies":
+            text = body.get("content") or ""
+            if not text.strip():
+                return self._json({"error": "文件是空的"}, 400)
+            if not _valid_cookie_text(text):
+                return self._json(
+                    {"error": "这看着不是 cookies.txt。要用 Netscape 格式的导出文件。"}, 400)
+            try:
+                old = ""
+                if os.path.isfile(COOKIE_FILE):
+                    with open(COOKIE_FILE, encoding="utf-8", errors="replace") as f:
+                        old = f.read()
+                merged = _merge_cookie_text(old, text)
+                with open(COOKIE_FILE, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(merged)
+            except Exception as e:
+                return self._json({"error": f"写入失败：{e}"}, 500)
+            return self._json({"ok": True, "status": cookie_status()})
+
+        if p.path == "/api/cookies/raw":
+            items = body.get("cookies") or []
+            if not isinstance(items, list) or not items:
+                return self._json({"error": "没有收到 cookie"}, 400)
+            text = _chrome_cookies_to_netscape(items)
+            if not text.strip("# Netscape HTTP Cookie File\n"):
+                return self._json({"error": "cookie 格式不对"}, 400)
+            try:
+                old = ""
+                if os.path.isfile(COOKIE_FILE):
+                    with open(COOKIE_FILE, encoding="utf-8", errors="replace") as f:
+                        old = f.read()
+                with open(COOKIE_FILE, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(_merge_cookie_text(old, text))
+            except Exception as e:
+                return self._json({"error": f"写入失败：{e}"}, 500)
+            return self._json({"ok": True, "count": len(items),
+                               "status": cookie_status()})
+
+        if p.path == "/api/extension/store":
+            exe = _find_browser_exe("Edge")
+            want = (body.get("browser") or "").lower()
+            url = EXT_STORE_EDGE if want == "edge" else EXT_STORE_CHROME
+            ok = open_in_browser(url)
+            return self._json({"ok": ok, "url": url,
+                               "fallback": EXT_STORE_SEARCH,
+                               "error": None if ok else "打不开浏览器"})
+
+        if p.path == "/api/extension/open":
+            path = ensure_extension_dir()
+            ok = open_extension_page()
+            return self._json({"ok": ok, "path": path or "",
+                               "error": None if ok else "没找到 Chrome 或 Edge"})
+
+        if p.path == "/api/connect":
+            key = body.get("platform") or ""
+            home = next((u for k, _n, u, _d in PLATFORMS if k == key), None)
+            if not home:
+                return self._json({"error": "未知平台"}, 400)
+            ok, msg = ensure_login_browser(home)
+            if not ok:
+                return self._json({"error": msg or "浏览器启动失败"}, 500)
+            return self._json({"ok": True, "url": home})
+
+        if p.path == "/api/connect/save":
+            key = body.get("platform") or ""
+            n = save_platform_cookies(key)
+            if not n:
+                return self._json({"error": "这个平台还没有 cookie，先登录"}, 200)
+            return self._json({"ok": True, "saved": n, "status": cookie_status()})
+
+        if p.path == "/api/open":
+            url = (body.get("url") or "").strip()
+            if not _url_allowed(url):
+                return self._json({"error": "链接不合法"}, 400)
+            return self._json({"ok": open_in_browser(url)})
+
+        if p.path == "/api/cookies/auto":
+            if not AUTO_LOCK.acquire(blocking=False):
+                return self._json({"error": "正在获取中，请稍候"}, 429)
+            try:
+                host = self.headers.get("Host") or f"127.0.0.1:{PORT}"
+                reopen = f"http://{host}/"
+                only = body.get("browser") or None
+                if only not in (None, "Chrome", "Edge"):
+                    only = None
+                text, browser, notes = auto_grab_cookies(reopen_url=reopen, only=only)
+                if not text:
+                    return self._json({
+                        "error": "自动获取失败",
+                        "notes": notes,
+                        "hint": "需要至少有一个浏览器（Chrome / Edge）当前没在运行。"
+                                "先把它完全退出（含后台进程），再点一次。",
+                    }, 200)
+                old = ""
+                if os.path.isfile(COOKIE_FILE):
+                    with open(COOKIE_FILE, encoding="utf-8", errors="replace") as f:
+                        old = f.read()
+                merged = _merge_cookie_text(old, text)
+                with open(COOKIE_FILE, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(merged)
+                return self._json({"ok": True, "browser": browser,
+                                   "notes": notes, "status": cookie_status()})
+            except Exception as e:
+                return self._json({"error": f"获取失败：{e}"}, 500)
+            finally:
+                AUTO_LOCK.release()
+
+        if p.path == "/api/config":
+            raw = (body.get("out") or "").strip().strip('"').strip("'")
+            if not raw:
+                return self._json({"error": "路径不能为空"}, 400)
+            path = os.path.expandvars(os.path.expanduser(raw))
+            if not os.path.isabs(path):
+                path = os.path.join(DATA_DIR, path)
+            path = os.path.normpath(path)
+            try:
+                os.makedirs(path, exist_ok=True)
+                if not os.access(path, os.W_OK):
+                    raise PermissionError("没有写入权限")
+                save_out(path)
+                return self._json({"ok": True, "out": path})
+            except Exception as e:
+                return self._json({"error": f"这个路径不能用：{e}"}, 400)
+
+        if p.path == "/api/grab":
+            video_url = body.get("video_url")
+            audio_url = body.get("audio_url")
+            mp4_url = body.get("mp4_url")
+            via = body.get("via") or "site"
+            kind = body.get("kind") or "video"
+            if kind not in ("video", "mp3"):
+                kind = "video"
+            name = safe_name(body.get("name") or "video")
+
+            if via == "ytdlp":
+                src = body.get("url")
+                if not src:
+                    return self._json({"error": "缺少视频链接"}, 400)
+                try:
+                    height = int(body.get("height") or 0)
+                except (TypeError, ValueError):
+                    height = 0
+                tid = uuid.uuid4().hex[:12]
+                set_task(tid, state="queued", stage="排队中", progress=0,
+                         kind=kind, ext=".mp3" if kind == "mp3" else ".mp4")
+                threading.Thread(target=run_ytdlp_job, daemon=True,
+                                 args=(tid, src, name, kind, height)).start()
+                return self._json({"id": tid, "kind": kind})
+
+            if not (video_url or mp4_url or audio_url):
+                return self._json({"error": "缺少媒体地址"}, 400)
+            tid = uuid.uuid4().hex[:12]
+            set_task(tid, state="queued", stage="排队中", progress=0,
+                     kind=kind, ext=".mp3" if kind == "mp3" else ".mp4")
+            threading.Thread(target=run_job, daemon=True,
+                             args=(tid, video_url, audio_url, mp4_url, name, kind)).start()
+            return self._json({"id": tid, "kind": kind})
+
+        return self._json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        if not self._same_origin():
+            return self._json({"error": "blocked: cross-origin request"}, 403)
+        p = urllib.parse.urlparse(self.path)
+        if p.path == "/api/cookies":
+            try:
+                if os.path.isfile(COOKIE_FILE):
+                    os.remove(COOKIE_FILE)
+                return self._json({"ok": True, "status": cookie_status()})
+            except Exception as e:
+                return self._json({"error": f"删除失败：{e}"}, 500)
+        return self._json({"error": "not found"}, 404)
+
+
+def safe_name(s, maxlen=90):
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", s).strip(" .")
+    return s[:maxlen] or "video"
+
+
+def suggest_name(url):
+    u = urllib.parse.urlparse(url)
+    host = (u.netloc or "").lower().replace("www.", "")
+    m = re.search(r"(BV[0-9A-Za-z]{10})", url)
+    if m:
+        return "bilibili_" + m.group(1)
+    seg = [s for s in u.path.split("/") if s]
+    tail = re.sub(r"[^\w\-.]", "", seg[-1])[:24] if seg else ""
+    site = host.split(".")[0] or "video"
+    return f"{site}_{tail}" if tail else site
+
+
+class Server(socketserver.ThreadingTCPServer):
+    # Windows 上 SO_REUSEADDR 会允许两个进程绑同一端口，
+    # 导致请求被旧进程接走，必须关掉。
+    allow_reuse_address = (sys.platform != "win32")
+    daemon_threads = True
+
+
+def main():
+    if sys.platform == "win32":
+        try:
+            os.system("chcp 65001 >nul")
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    port = PORT
+    for _ in range(12):
+        try:
+            httpd = Server(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            # 首选端口被占，先确认是不是自己已经在跑
+            if port == PORT:
+                try:
+                    with urllib.request.urlopen(
+                            f"http://127.0.0.1:{PORT}/api/env", timeout=2) as r:
+                        json.load(r)
+                    print(f"已有实例在运行：http://127.0.0.1:{PORT}")
+                    if "--no-browser" not in sys.argv:
+                        import webbrowser
+                        webbrowser.open(f"http://127.0.0.1:{PORT}")
+                    return 0
+                except Exception:
+                    pass
+            port += 1
+    else:
+        print("端口被占满，放弃")
+        return 1
+
+    os.makedirs(load_out(), exist_ok=True)
+    ext = ensure_extension_dir()
+    ff = find_ffmpeg()
+    print("=" * 56)
+    print(f"  本地视频提取  →  http://127.0.0.1:{port}")
+    print(f"  数据目录      →  {DATA_DIR}")
+    print(f"  保存目录      →  {load_out()}")
+    print(f"  ffmpeg        →  {ff or '未找到（将只下载单文件低码率版）'}")
+    print(f"  yt-dlp        →  {'已就绪（支持 YouTube 等 1800+ 站点）' if _ytdlp_available() else '未安装，仅国内平台可用'}")
+    print(f"  cookies.txt   →  {'已就绪' if os.path.isfile(COOKIE_FILE) else '未提供（X / Vimeo 等需登录的站点用不了）'}")
+    print(f"  浏览器扩展    →  {ext or '未找到'}")
+    print("=" * 56)
+
+    if "--no-browser" not in sys.argv:
+        import webbrowser
+        threading.Timer(0.9, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

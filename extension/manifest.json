@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "视频提取 · Cookie 助手",
+  "version": "1.0.0",
+  "description": "把当前网站的登录状态一键同步给本地的视频提取器，不用手动导出文件。",
+  "permissions": ["cookies", "activeTab", "tabs"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:8765/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "同步登录状态到本地提取器"
+  }
+}
