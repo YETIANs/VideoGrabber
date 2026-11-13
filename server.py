@@ -1037,21 +1037,14 @@ RAM_TOTAL_GB, RAM_AVAIL_GB = _memory_gb()
 
 
 def _upload_limit_bytes():
-    """上传上限跟着机器配置走：
-    - 内存的 1/2 作为上限（大文件只是落盘，不驻留内存）
-    - 下限 2 GB，上限 32 GB
-    - 再和「上传目录所在盘」的剩余空间取小，留 3 GB 余量
+    """上传上限只看内存，不受某个盘剩多少影响。
+
+    - 内存的 1/2，下限 2 GB，上限 32 GB
+    - 文件本身是流式写到「上传目录」（跟随下载目录，可设到大容量盘），
+      不驻留内存，所以内存不是瓶颈、磁盘才是；但上限不该被系统盘剩余空间压死。
     """
     by_ram = max(2.0, min(RAM_TOTAL_GB * 0.5, 32.0))
-    try:
-        probe = os.path.dirname(load_out().rstrip("\\/")) or DATA_DIR
-        if not os.path.isdir(probe):
-            probe = DATA_DIR
-        free_gb = shutil.disk_usage(probe).free / (1024 ** 3)
-        by_disk = max(2.0, free_gb - 3.0)
-    except Exception:
-        by_disk = by_ram
-    return int(min(by_ram, by_disk) * 1024 ** 3), min(by_ram, by_disk)
+    return int(by_ram * 1024 ** 3), by_ram
 
 
 UPLOAD_MAX, UPLOAD_MAX_GB = _upload_limit_bytes()
