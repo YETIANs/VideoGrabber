@@ -999,7 +999,59 @@ SALT_OUTER = "XTv2"
 TASKS = {}
 LOCK = threading.Lock()
 AUTO_LOCK = threading.Lock()
-UPLOAD_MAX = 1024 * 1024 * 1024   # 1 GB
+def _memory_gb():
+    """返回 (物理内存总量, 可用内存)，单位 GB。"""
+    if sys.platform != "win32":
+        try:
+            with open("/proc/meminfo") as f:
+                kv = {}
+                for line in f:
+                    k, _, v = line.partition(":")
+                    kv[k.strip()] = int(v.split()[0]) / (1024 ** 2)
+                return kv.get("MemTotal", 8.0), kv.get("MemAvailable", 4.0)
+        except Exception:
+            return 8.0, 4.0
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+        return (st.ullTotalPhys / (1024 ** 3), st.ullAvailPhys / (1024 ** 3))
+    except Exception:
+        return 8.0, 4.0
+
+
+RAM_TOTAL_GB, RAM_AVAIL_GB = _memory_gb()
+
+
+def _upload_limit_bytes():
+    """上传上限跟着机器配置走：
+    - 内存的 1/2 作为上限（大文件也只是落盘，不驻留内存）
+    - 下限 2 GB，上限 32 GB
+    - 再和磁盘剩余空间取小，留 3 GB 余量
+    """
+    by_ram = max(2.0, min(RAM_TOTAL_GB * 0.5, 32.0))
+    try:
+        free_gb = shutil.disk_usage(DATA_DIR).free / (1024 ** 3)
+        by_disk = max(2.0, free_gb - 3.0)
+    except Exception:
+        by_disk = by_ram
+    return int(min(by_ram, by_disk) * 1024 ** 3), min(by_ram, by_disk)
+
+
+UPLOAD_MAX, UPLOAD_MAX_GB = _upload_limit_bytes()
 
 
 # ============================================================ 签名 / 解析
@@ -1657,29 +1709,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if n <= 0:
             return self._json({"error": "空文件"}, 400)
         if n > UPLOAD_MAX:
-            return self._json({"error": "文件太大，上限 1 GB"}, 413)
-        try:
-            body = self.rfile.read(n)
-        except Exception as e:
-            return self._json({"error": f"读取失败：{e}"}, 500)
-        fn, data = parse_multipart(body, ctype)
-        if not data:
-            return self._json({"error": "没收到文件内容"}, 400)
+            return self._json(
+                {"error": f"文件太大，上限 {UPLOAD_MAX // (1024 ** 3)} GB"}, 413)
 
-        name = safe_upload_name(fn)
-        stem, ext = os.path.splitext(name)
-        dest = os.path.join(upload_dir(), name)
-        i = 2
-        while os.path.exists(dest):
-            dest = os.path.join(upload_dir(), f"{stem} ({i}){ext}")
-            i += 1
+        m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', ctype)
+        if not m:
+            return self._json({"error": "缺少 boundary"}, 400)
+        delim = b"--" + (m.group(1) or m.group(2)).strip().encode()
+
+        # 流式写盘：大文件不能整个读进内存
+        tmp = os.path.join(upload_dir(), f".incoming_{int(time.time() * 1000)}")
+        fh = None
+        buf = b""
+        got = 0
+        state = "header"
+        fn = None
         try:
-            with open(dest, "wb") as f:
-                f.write(data)
+            while got < n:
+                chunk = self.rfile.read(min(256 * 1024, n - got))
+                if not chunk:
+                    break
+                got += len(chunk)
+                buf += chunk
+
+                if state == "header":
+                    idx = buf.find(b"\r\n\r\n")
+                    if idx < 0:
+                        if len(buf) > 65536:      # header 不该这么长
+                            raise RuntimeError("表单格式不对")
+                        continue
+                    head = buf[:idx].decode("utf-8", "replace")
+                    fm = re.search(r'filename="([^"]*)"', head)
+                    if not fm:
+                        raise RuntimeError("没找到文件字段")
+                    fn = fm.group(1)
+                    buf = buf[idx + 4:]
+                    fh = open(tmp, "wb")
+                    state = "body"
+
+                if state == "body":
+                    tail = b"\r\n" + delim
+                    idx = buf.find(tail)
+                    if idx >= 0:
+                        fh.write(buf[:idx])
+                        state = "done"
+                        break
+                    # 末尾可能是半个 boundary，留着下次再判断
+                    keep = len(tail) - 1
+                    if len(buf) > keep:
+                        fh.write(buf[:-keep])
+                        buf = buf[-keep:]
+
+            if state != "done":
+                raise RuntimeError("上传中断，文件不完整")
+        except Exception as e:
+            if fh:
+                fh.close()
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return self._json({"error": f"上传失败：{e}"}, 500)
+        finally:
+            if fh and not fh.closed:
+                fh.close()
+
+        try:
+            size = os.path.getsize(tmp)
+            if size <= 0:
+                os.remove(tmp)
+                return self._json({"error": "文件是空的"}, 400)
+            name = safe_upload_name(fn)
+            stem, ext = os.path.splitext(name)
+            dest = os.path.join(upload_dir(), name)
+            i = 2
+            while os.path.exists(dest):
+                dest = os.path.join(upload_dir(), f"{stem} ({i}){ext}")
+                i += 1
+            shutil.move(tmp, dest)
         except Exception as e:
             return self._json({"error": f"保存失败：{e}"}, 500)
         return self._json({"ok": True, "name": os.path.basename(dest),
-                           "size": len(data)})
+                           "size": size})
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
@@ -1692,7 +1803,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p.path == "/api/env":
             return self._json({"ffmpeg": bool(find_ffmpeg()), "out": load_out(),
                                "default": DEFAULT_OUT,
-                               "places": common_places()})
+                               "places": common_places(),
+                               "upload_max_gb": round(UPLOAD_MAX_GB, 1),
+                               "ram_total_gb": round(RAM_TOTAL_GB, 1),
+                               "ram_free_gb": round(RAM_AVAIL_GB, 1)})
 
         if p.path == "/api/pick-dir":
             # 对话框只能在有桌面会话的进程里弹；无桌面时会永久阻塞，所以加超时。
