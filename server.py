@@ -1038,13 +1038,16 @@ RAM_TOTAL_GB, RAM_AVAIL_GB = _memory_gb()
 
 def _upload_limit_bytes():
     """上传上限跟着机器配置走：
-    - 内存的 1/2 作为上限（大文件也只是落盘，不驻留内存）
+    - 内存的 1/2 作为上限（大文件只是落盘，不驻留内存）
     - 下限 2 GB，上限 32 GB
-    - 再和磁盘剩余空间取小，留 3 GB 余量
+    - 再和「上传目录所在盘」的剩余空间取小，留 3 GB 余量
     """
     by_ram = max(2.0, min(RAM_TOTAL_GB * 0.5, 32.0))
     try:
-        free_gb = shutil.disk_usage(DATA_DIR).free / (1024 ** 3)
+        probe = os.path.dirname(load_out().rstrip("\\/")) or DATA_DIR
+        if not os.path.isdir(probe):
+            probe = DATA_DIR
+        free_gb = shutil.disk_usage(probe).free / (1024 ** 3)
         by_disk = max(2.0, free_gb - 3.0)
     except Exception:
         by_disk = by_ram
@@ -1260,8 +1263,22 @@ def _clean_parts(parts):
 
 
 def upload_dir():
-    d = os.path.join(DATA_DIR, ".uploads")
+    """上传的临时文件跟着下载目录走——用户通常把下载放在大容量盘，
+    放系统盘（%LOCALAPPDATA%）遇到 C 盘紧张会直接失败。"""
+    try:
+        base = os.path.dirname(load_out().rstrip("\\/")) or DATA_DIR
+        if not os.path.isdir(base):
+            base = DATA_DIR
+    except Exception:
+        base = DATA_DIR
+    d = os.path.join(base, ".uploads")
     os.makedirs(d, exist_ok=True)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(d, 0x02)   # 隐藏
+        except Exception:
+            pass
     return d
 
 
