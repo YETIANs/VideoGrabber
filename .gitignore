@@ -28,3 +28,4 @@ cdp_probe.py
 login_flow_test.py
 *.log
 ui*.png
+.uploads/

@@ -174,6 +174,34 @@
   .ckway b{color:var(--text);font-weight:500}
   .ckguide a{color:#1a56db;text-decoration:none;border-bottom:1px solid #c2d6f2}
   .ckguide a:hover{color:#123c9c;border-bottom-color:#123c9c}
+  .drop{
+    border:1.5px dashed var(--line-strong);border-radius:12px;
+    padding:26px 20px;text-align:center;cursor:pointer;
+    transition:.15s;background:#fafafa
+  }
+  .drop:hover,.drop.over{border-color:#16161a;background:#f4f4f6}
+  .dropinner b{display:block;font-size:13px;color:var(--text);font-weight:500;margin-bottom:4px}
+  .dropinner span{font-size:11.5px;color:var(--faint)}
+  .gifopts{margin-top:14px}
+  .gifinfo{
+    font-size:12px;color:#4a4a54;background:#f7f7f9;border-radius:8px;
+    padding:9px 11px;margin-bottom:12px;word-break:break-all
+  }
+  .gifrow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  .gifrow label{display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:var(--faint)}
+  .gifrow select,.gifrow input{
+    height:32px;border:1px solid var(--line);border-radius:8px;padding:0 8px;
+    font-family:inherit;font-size:12.5px;color:var(--text);background:#fff;
+    width:100%;box-sizing:border-box
+  }
+  .gifactions{display:flex;align-items:center;gap:12px;margin-top:14px}
+  .gifprog{font-size:12px;color:var(--muted)}
+  .gifresult{
+    margin-top:16px;padding-top:14px;border-top:1px solid #f0f0f2;
+    display:flex;gap:14px;align-items:flex-start
+  }
+  .gifresult img{max-width:260px;max-height:200px;border-radius:8px;border:1px solid var(--line)}
+  .gifmeta{display:flex;flex-direction:column;gap:8px;font-size:11.5px;color:var(--faint)}
   .browbox{margin-top:14px;padding-top:11px;border-top:1px solid #f0f0f2}
   .browhead{font-size:11.5px;color:var(--faint);margin-bottom:4px}
   .browbox .ckrow{padding:6px 0;border-top:0}
@@ -262,6 +290,60 @@
     </div>
     <p class="ckhint" id="ckhint"></p>
     <input type="file" id="ckfile" accept=".txt,text/plain" hidden>
+  </section>
+
+  <section class="card">
+    <div class="cardhead">
+      <h2>本地视频转 GIF</h2>
+      <span class="ckbtn">
+        <button class="btn ghost sm" id="gifreset" hidden>换一个</button>
+      </span>
+    </div>
+    <div class="drop" id="gifdrop">
+      <input type="file" id="giffile" accept="video/*" hidden>
+      <div class="dropinner">
+        <b>把视频拖进来</b>
+        <span>或点这里选择文件 · mp4 / mov / mkv / webm / avi，最大 1 GB</span>
+      </div>
+    </div>
+    <div class="gifopts" id="gifopts" hidden>
+      <div class="gifinfo" id="gifinfo"></div>
+      <div class="gifrow">
+        <label>帧率
+          <select id="giffps">
+            <option value="8">8 fps（文件小）</option>
+            <option value="12" selected>12 fps（推荐）</option>
+            <option value="15">15 fps</option>
+            <option value="20">20 fps（流畅）</option>
+          </select>
+        </label>
+        <label>宽度
+          <select id="gifwidth">
+            <option value="320">320 px</option>
+            <option value="480" selected>480 px</option>
+            <option value="640">640 px</option>
+            <option value="800">800 px</option>
+          </select>
+        </label>
+        <label>开始（秒）
+          <input id="gifstart" type="number" min="0" step="0.5" placeholder="0">
+        </label>
+        <label>时长（秒）
+          <input id="gifdur" type="number" min="0.5" step="0.5" placeholder="全部">
+        </label>
+      </div>
+      <div class="gifactions">
+        <button class="btn" id="gifgo">开始转换</button>
+        <span class="gifprog" id="gifprog"></span>
+      </div>
+      <div class="gifresult" id="gifresult" hidden>
+        <img id="gifimg" alt="GIF 预览">
+        <div class="gifmeta">
+          <a class="btn ghost sm" id="gifdl" download>下载 GIF</a>
+          <span id="gifsize"></span>
+        </div>
+      </div>
+    </div>
   </section>
 
   <section class="card">
@@ -567,6 +649,110 @@ loadFiles();
 loadCookies();
 loadBrowsers();
 loadPlatforms();
+
+// ---------- 本地视频转 GIF ----------
+let gifFile = null, gifTimer = null;
+
+$("#gifdrop").onclick = () => $("#giffile").click();
+$("#gifdrop").addEventListener("dragover", e => {
+  e.preventDefault(); $("#gifdrop").classList.add("over");
+});
+$("#gifdrop").addEventListener("dragleave", () => $("#gifdrop").classList.remove("over"));
+$("#gifdrop").addEventListener("drop", e => {
+  e.preventDefault(); $("#gifdrop").classList.remove("over");
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if(f) handleGifFile(f);
+});
+$("#giffile").onchange = e => {
+  const f = e.target.files && e.target.files[0];
+  if(f) handleGifFile(f);
+};
+
+async function handleGifFile(file){
+  const okExt = /\.(mp4|mov|mkv|webm|avi|flv|m4v|ts|wmv)$/i.test(file.name);
+  if(!/^video\//i.test(file.type || "") && !okExt){
+    showMsg("这个文件看着不是视频", "err"); return;
+  }
+  if(file.size > 1024 * 1024 * 1024){
+    showMsg("文件超过 1 GB，换个短一点的", "err"); return;
+  }
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  $("#gifopts").hidden = false;
+  $("#gifresult").hidden = true;
+  $("#gifreset").hidden = true;
+  $("#gifgo").disabled = true;
+  $("#gifinfo").textContent = "上传中：" + file.name + "（" + fmtSize(file.size) + "）";
+  try{
+    const r = await fetch("/api/upload", {method: "POST", body: fd});
+    const d = await r.json();
+    if(d.error){ showMsg(d.error, "err"); return; }
+    gifFile = d.name;
+    $("#gifinfo").textContent = "已上传：" + d.name + " · " + fmtSize(d.size);
+    $("#gifreset").hidden = false;
+    $("#gifgo").disabled = false;
+  }catch(e){
+    showMsg("上传失败：" + e.message, "err");
+  }
+}
+
+$("#gifreset").onclick = () => {
+  gifFile = null;
+  if(gifTimer){ clearInterval(gifTimer); gifTimer = null; }
+  $("#gifopts").hidden = true;
+  $("#gifreset").hidden = true;
+  $("#gifprog").textContent = "";
+  $("#giffile").value = "";
+};
+
+$("#gifgo").onclick = async () => {
+  if(!gifFile){ showMsg("先选一个视频", "err"); return; }
+  const btn = $("#gifgo");
+  btn.disabled = true;
+  $("#gifresult").hidden = true;
+  $("#gifprog").textContent = "提交中…";
+  try{
+    const d = await api("/api/togif", {
+      file: gifFile,
+      fps: +$("#giffps").value,
+      width: +$("#gifwidth").value,
+      start: $("#gifstart").value || null,
+      duration: $("#gifdur").value || null
+    });
+    if(d.error){ showMsg(d.error, "err"); $("#gifprog").textContent = ""; return; }
+    pollGif(d.id);
+  }catch(e){
+    showMsg("提交失败：" + e.message, "err");
+    $("#gifprog").textContent = "";
+  }finally{
+    btn.disabled = false;
+  }
+};
+
+function pollGif(id){
+  if(gifTimer) clearInterval(gifTimer);
+  gifTimer = setInterval(async () => {
+    try{
+      const t = await (await fetch("/api/task?id=" + id)).json();
+      $("#gifprog").textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
+      if(t.state === "done"){
+        clearInterval(gifTimer); gifTimer = null;
+        $("#gifprog").textContent = "完成";
+        const url = "/file?n=" + encodeURIComponent(t.file);
+        $("#gifimg").src = url;
+        $("#gifdl").href = url;
+        $("#gifdl").setAttribute("download", t.file);
+        $("#gifsize").textContent = fmtSize(t.size || 0);
+        $("#gifresult").hidden = false;
+        loadFiles();
+      }else if(t.state === "error"){
+        clearInterval(gifTimer); gifTimer = null;
+        $("#gifprog").textContent = "失败";
+        showMsg(t.stage || "转换失败", "err");
+      }
+    }catch(e){}
+  }, 800);
+}
 $("#url").focus();
 
 let watchTimer = null;

@@ -999,6 +999,7 @@ SALT_OUTER = "XTv2"
 TASKS = {}
 LOCK = threading.Lock()
 AUTO_LOCK = threading.Lock()
+UPLOAD_MAX = 1024 * 1024 * 1024   # 1 GB
 
 
 # ============================================================ 签名 / 解析
@@ -1206,6 +1207,110 @@ def _clean_parts(parts):
         pass
 
 
+def upload_dir():
+    d = os.path.join(DATA_DIR, ".uploads")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def parse_multipart(body, content_type):
+    """极简 multipart/form-data 解析，取第一个带文件名的字段。"""
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type or "")
+    if not m:
+        return None, None
+    boundary = (m.group(1) or m.group(2)).strip().encode()
+    sep = b"--" + boundary
+    for chunk in body.split(sep)[1:]:
+        if chunk.startswith(b"--"):
+            break
+        head, _, data = chunk.partition(b"\r\n\r\n")
+        if not data:
+            continue
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        hdr = head.decode("utf-8", "replace")
+        fm = re.search(r'filename="([^"]*)"', hdr)
+        if fm and fm.group(1):
+            return fm.group(1), data
+    return None, None
+
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v", ".ts", ".wmv"}
+
+
+def safe_upload_name(fn):
+    base = os.path.basename(fn or "video")
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    if ext not in VIDEO_EXTS:
+        ext = ".mp4"
+    stem = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", stem).strip(" .") or "video"
+    return stem[:60] + ext
+
+
+def to_gif_job(tid, src, out_dir, base, fps, width, start, duration):
+    """用两级调色板转高质量 GIF（直接 palettegen 会灰蒙蒙）。"""
+    try:
+        ff = find_ffmpeg()
+        if not ff:
+            raise RuntimeError("没有 ffmpeg，无法转换")
+        os.makedirs(out_dir, exist_ok=True)
+        base = unique_base(out_dir, base)
+        final = os.path.join(out_dir, base + ".gif")
+
+        fps = max(2, min(30, int(fps or 12)))
+        width = max(80, min(1280, int(width or 480)))
+        vf = (f"fps={fps},scale={width}:-1:flags=lanczos,"
+              f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+              f"[s1][p]paletteuse=dither=bayer:bayer_scale=3")
+
+        cmd = [ff, "-y", "-loglevel", "error", "-stats"]
+        if start:
+            cmd += ["-ss", str(start)]
+        cmd += ["-i", src]
+        if duration:
+            cmd += ["-t", str(duration)]
+        cmd += ["-vf", vf, "-loop", "0", final]
+
+        set_task(tid, state="downloading", stage="转换中", progress=5)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace")
+        # ffmpeg -stats 把进度写在 stderr，形如 time=00:00:03.20
+        total = _video_duration(ff, src)
+        pct = 5
+        for line in proc.stderr:
+            m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
+            if m and total:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                pct = max(pct, min(95, 5 + int(sec / total * 90)))
+                set_task(tid, progress=pct)
+        proc.wait()
+
+        if proc.returncode != 0 or not os.path.isfile(final):
+            raise RuntimeError("转换失败，检查视频是否可读")
+
+        size = os.path.getsize(final)
+        set_task(tid, state="done", progress=100, stage="完成",
+                 file=os.path.basename(final), size=size)
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200], progress=100)
+
+
+def _video_duration(ff, path, timeout=20):
+    """从 ffmpeg 的 stderr 里抠出时长（没有 ffprobe 也能用）。"""
+    try:
+        r = subprocess.run([ff, "-i", path], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", r.stderr or "")
+        if m:
+            return (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                    + float(m.group(3)))
+    except Exception:
+        pass
+    return 0
+
+
 def run_job(tid, video_url, audio_url, mp4_url, name, kind="video"):
     out = load_out()
     parts = os.path.join(out, ".parts")
@@ -1406,6 +1511,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return False
         return True
 
+    def _handle_upload(self, ctype):
+        if "multipart/form-data" not in (ctype or "").lower():
+            return self._json({"error": "需要 multipart/form-data"}, 400)
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return self._json({"error": "空文件"}, 400)
+        if n > UPLOAD_MAX:
+            return self._json({"error": "文件太大，上限 1 GB"}, 413)
+        try:
+            body = self.rfile.read(n)
+        except Exception as e:
+            return self._json({"error": f"读取失败：{e}"}, 500)
+        fn, data = parse_multipart(body, ctype)
+        if not data:
+            return self._json({"error": "没收到文件内容"}, 400)
+
+        name = safe_upload_name(fn)
+        stem, ext = os.path.splitext(name)
+        dest = os.path.join(upload_dir(), name)
+        i = 2
+        while os.path.exists(dest):
+            dest = os.path.join(upload_dir(), f"{stem} ({i}){ext}")
+            i += 1
+        try:
+            with open(dest, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            return self._json({"error": f"保存失败：{e}"}, 500)
+        return self._json({"ok": True, "name": os.path.basename(dest),
+                           "size": len(data)})
+
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(p.query)
@@ -1498,10 +1634,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._same_origin():
             return self._json({"error": "blocked: cross-origin request"}, 403)
-        # 浏览器跨站请求若用 text/plain 可绕过 CORS 预检，这里强制要求 JSON
-        if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
-            return self._json({"error": "content-type must be application/json"}, 415)
         p = urllib.parse.urlparse(self.path)
+        ctype_raw = self.headers.get("Content-Type") or ""
+        ctype = ctype_raw.lower()
+
+        # 文件上传走 multipart，其余接口仍然只收 JSON
+        if p.path == "/api/upload":
+            return self._handle_upload(ctype_raw)
+
+        # 浏览器跨站请求若用 text/plain 可绕过 CORS 预检，这里强制要求 JSON
+        if not ctype.startswith("application/json"):
+            return self._json({"error": "content-type must be application/json"}, 415)
         n = int(self.headers.get("Content-Length") or 0)
         try:
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -1580,6 +1723,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": f"写入失败：{e}"}, 500)
             return self._json({"ok": True, "count": len(items),
                                "status": cookie_status()})
+
+        if p.path == "/api/togif":
+            fn = os.path.basename(body.get("file") or "")
+            src = os.path.join(upload_dir(), fn)
+            if not fn or not os.path.isfile(src):
+                return self._json({"error": "先上传一个视频"}, 400)
+            base = os.path.splitext(fn)[0]
+            tid = hashlib.md5(f"{time.time()}{fn}".encode()).hexdigest()[:12]
+            set_task(tid, state="queued", stage="排队中", progress=0)
+            threading.Thread(
+                target=to_gif_job,
+                args=(tid, src, load_out(), base,
+                      body.get("fps"), body.get("width"),
+                      body.get("start"), body.get("duration")),
+                daemon=True).start()
+            return self._json({"id": tid})
 
         if p.path == "/api/extension/store":
             exe = _find_browser_exe("Edge")
