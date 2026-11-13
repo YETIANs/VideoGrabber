@@ -1352,6 +1352,90 @@ def to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
         set_task(tid, state="error", stage=str(e)[:200], progress=100)
 
 
+def compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
+    """压缩视频。给了 target_mb 就按目标体积反算码率，否则按 CRF 走质量。
+
+    target_mb 是"目标体积"，单位 MB（前端会把 KB/GB 换算好再传）。
+    """
+    try:
+        ff = find_ffmpeg()
+        if not ff:
+            raise RuntimeError("没有 ffmpeg，无法压缩")
+        os.makedirs(out_dir, exist_ok=True)
+        base = unique_base(out_dir, base)
+        final = os.path.join(out_dir, base + ".mp4")
+
+        total = _video_duration(ff, src) or 0
+        vf = []
+        if height:
+            try:
+                h = int(height)
+                if 120 <= h <= 2160:
+                    vf.append(f"scale=-2:{h}")
+            except (TypeError, ValueError):
+                pass
+        if fps:
+            try:
+                f = float(fps)
+                if 5 <= f <= 60:
+                    vf.append(f"fps={f:g}")
+            except (TypeError, ValueError):
+                pass
+
+        cmd = [ff, "-y", "-loglevel", "error", "-stats", "-i", src]
+        if vf:
+            cmd += ["-vf", ",".join(vf)]
+        cmd += ["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p"]
+
+        note = ""
+        if target_mb:
+            target = max(0.05, float(target_mb))
+            if total <= 0:
+                raise RuntimeError("读不出视频时长，没法按大小压缩")
+            total_kbps = int(target * 1024 * 8 / total)
+            if total_kbps < 120:
+                raise RuntimeError(
+                    f"目标太小：{target:g} MB 对 {total:.0f} 秒视频意味着 {total_kbps}kbps，压不出来")
+            audio_kbps = 128 if total_kbps > 700 else (96 if total_kbps > 350 else 64)
+            video_kbps = max(60, total_kbps - audio_kbps)
+            cmd += ["-b:v", f"{video_kbps}k",
+                    "-maxrate", f"{int(video_kbps * 1.25)}k",
+                    "-bufsize", f"{video_kbps * 2}k"]
+            cmd += ["-c:a", "aac", "-b:a", f"{audio_kbps}k"]
+            if target >= 1:
+                note = f"目标 {target:g}MB · 视频 {video_kbps}kbps"
+            else:
+                note = f"目标 {target * 1024:.0f}KB · 视频 {video_kbps}kbps"
+        else:
+            crf = max(16, min(32, int(crf or 23)))
+            cmd += ["-crf", str(crf), "-c:a", "aac", "-b:a", "128k"]
+            note = f"质量 CRF {crf}"
+
+        cmd += ["-movflags", "+faststart", final]
+
+        set_task(tid, state="downloading", stage="压缩中", progress=3)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace")
+        pct = 3
+        for line in proc.stderr:
+            m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
+            if m and total:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                pct = max(pct, min(97, 3 + int(sec / total * 94)))
+                set_task(tid, progress=pct)
+        proc.wait()
+
+        if proc.returncode != 0 or not os.path.isfile(final):
+            raise RuntimeError("压缩失败，检查视频是否可读")
+
+        set_task(tid, state="done", progress=100, stage="完成",
+                 file=os.path.basename(final),
+                 size=os.path.getsize(final), note=note)
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200], progress=100)
+
+
 def _video_duration(ff, path, timeout=20):
     """从 ffmpeg 的 stderr 里抠出时长（没有 ffprobe 也能用）。"""
     try:
@@ -1778,6 +1862,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": f"写入失败：{e}"}, 500)
             return self._json({"ok": True, "count": len(items),
                                "status": cookie_status()})
+
+        if p.path == "/api/compress":
+            fn = os.path.basename(body.get("file") or "")
+            src = os.path.join(upload_dir(), fn)
+            if not fn or not os.path.isfile(src):
+                return self._json({"error": "先上传一个视频"}, 400)
+            base = os.path.splitext(fn)[0] + "_compressed"
+            tid = hashlib.md5(f"c{time.time()}{fn}".encode()).hexdigest()[:12]
+            set_task(tid, state="queued", stage="排队中", progress=0)
+            threading.Thread(
+                target=compress_video_job,
+                args=(tid, src, load_out(), base,
+                      body.get("height"), body.get("fps"),
+                      body.get("crf"), body.get("target_mb")),
+                daemon=True).start()
+            return self._json({"id": tid})
 
         if p.path == "/api/togif":
             fn = os.path.basename(body.get("file") or "")

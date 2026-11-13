@@ -211,6 +211,15 @@
     border-radius:7px;font-family:inherit;font-size:11.5px;color:#4a4a54;cursor:pointer
   }
   .gifquick button:hover{border-color:#16161a;color:#16161a}
+  .tabs{display:inline-flex;background:#f2f2f5;border-radius:9px;padding:2px;gap:1px}
+  .tab{
+    border:0;background:transparent;padding:5px 11px;border-radius:7px;
+    font-family:inherit;font-size:12px;color:#5a5a64;cursor:pointer;transition:.13s
+  }
+  .tab.on{background:#fff;color:#16161a;box-shadow:0 1px 2px rgba(16,16,20,.08);font-weight:500}
+  .cmpunit{height:32px;border:1px solid var(--line);border-radius:8px;padding:0 6px;
+    font-family:inherit;font-size:12.5px;color:var(--text);background:#fff}
+  .cmphint{font-size:12px;color:var(--faint);height:32px;display:flex;align-items:center}
   .gifresult{
     margin-top:16px;padding-top:14px;border-top:1px solid #f0f0f2;
     display:flex;gap:14px;align-items:flex-start
@@ -309,8 +318,12 @@
 
   <section class="card">
     <div class="cardhead">
-      <h2>本地视频转 GIF</h2>
+      <h2>本地处理</h2>
       <span class="ckbtn">
+        <span class="tabs">
+          <button class="tab on" data-mode="gif">转 GIF</button>
+          <button class="tab" data-mode="compress">压缩视频</button>
+        </span>
         <button class="btn ghost sm" id="gifreset" hidden>换一个</button>
       </span>
     </div>
@@ -373,6 +386,71 @@
         <div class="gifmeta">
           <a class="btn ghost sm" id="gifdl" download>下载 GIF</a>
           <span id="gifsize"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="gifopts cmpbox" id="cmpopts" hidden>
+      <div class="gifinfo" id="cmpinfo"></div>
+      <div class="gifrow">
+        <label>分辨率
+          <select id="cmpheight">
+            <option value="">原画</option>
+            <option value="1080">1080p</option>
+            <option value="720" selected>720p</option>
+            <option value="480">480p</option>
+            <option value="360">360p</option>
+          </select>
+        </label>
+        <label>帧率
+          <select id="cmpfps">
+            <option value="">原帧率</option>
+            <option value="30" selected>30 fps</option>
+            <option value="24">24 fps</option>
+            <option value="15">15 fps</option>
+          </select>
+        </label>
+        <label>质量
+          <select id="cmpcrf">
+            <option value="20">高（文件大）</option>
+            <option value="23" selected>中（推荐）</option>
+            <option value="26">低（文件小）</option>
+            <option value="28">很低</option>
+          </select>
+        </label>
+        <label>输出
+          <span class="cmphint">MP4 / H.264</span>
+        </label>
+      </div>
+      <div class="giftarget">
+        <label class="gifsw">
+          <input type="checkbox" id="cmplimit">
+          <span>限制文件大小，压到</span>
+        </label>
+        <div class="giftargetrow" id="cmptargetrow" hidden>
+          <input id="cmptarget" type="number" min="0.1" step="0.1" value="50">
+          <select id="cmpunit" class="cmpunit">
+            <option value="0.001">KB</option>
+            <option value="1" selected>MB</option>
+            <option value="1024">GB</option>
+          </select>
+          <span class="gifquick">
+            <button type="button" data-mb="5">5M</button>
+            <button type="button" data-mb="10">10M</button>
+            <button type="button" data-mb="50">50M</button>
+            <button type="button" data-mb="100">100M</button>
+            <button type="button" data-mb="500">500M</button>
+          </span>
+        </div>
+      </div>
+      <div class="gifactions">
+        <button class="btn" id="cmpgo">开始压缩</button>
+        <span class="gifprog" id="cmpprog"></span>
+      </div>
+      <div class="gifresult" id="cmpresult" hidden>
+        <div class="gifmeta">
+          <a class="btn ghost sm" id="cmpdl" download>下载视频</a>
+          <span id="cmpsize"></span>
         </div>
       </div>
     </div>
@@ -685,6 +763,83 @@ loadPlatforms();
 // ---------- 本地视频转 GIF ----------
 let gifFile = null, gifTimer = null;
 
+let activeMode = "gif";
+document.querySelectorAll(".tab").forEach(t => {
+  t.onclick = () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
+    t.classList.add("on");
+    activeMode = t.dataset.mode;
+    if(gifFile){
+      $("#gifopts").hidden = activeMode !== "gif";
+      $("#cmpopts").hidden = activeMode !== "compress";
+    }
+  };
+});
+
+$("#cmplimit").onchange = e => {
+  $("#cmptargetrow").hidden = !e.target.checked;
+};
+
+document.querySelectorAll(".gifquick button[data-mb]").forEach(b => {
+  b.onclick = () => {
+    $("#cmptarget").value = b.dataset.mb;
+    $("#cmpunit").value = "1";
+  };
+});
+
+$("#cmpgo").onclick = async () => {
+  if(!gifFile){ showMsg("先选一个视频", "err"); return; }
+  const btn = $("#cmpgo");
+  btn.disabled = true;
+  $("#cmpresult").hidden = true;
+  $("#cmpprog").textContent = "提交中…";
+  const payload = {
+    file: gifFile,
+    height: $("#cmpheight").value || null,
+    fps: $("#cmpfps").value || null,
+    crf: +$("#cmpcrf").value
+  };
+  if($("#cmplimit").checked){
+    const v = +$("#cmptarget").value || 50;
+    const unit = +$("#cmpunit").value;
+    payload.target_mb = v * unit;
+  }
+  try{
+    const d = await api("/api/compress", payload);
+    if(d.error){ showMsg(d.error, "err"); $("#cmpprog").textContent = ""; return; }
+    pollCmp(d.id);
+  }catch(e){
+    showMsg("提交失败：" + e.message, "err");
+    $("#cmpprog").textContent = "";
+  }finally{
+    btn.disabled = false;
+  }
+};
+
+function pollCmp(id){
+  if(gifTimer) clearInterval(gifTimer);
+  gifTimer = setInterval(async () => {
+    try{
+      const t = await (await fetch("/api/task?id=" + id)).json();
+      $("#cmpprog").textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
+      if(t.state === "done"){
+        clearInterval(gifTimer); gifTimer = null;
+        $("#cmpprog").textContent = "完成";
+        const url = "/file?n=" + encodeURIComponent(t.file);
+        $("#cmpdl").href = url;
+        $("#cmpdl").setAttribute("download", t.file);
+        $("#cmpsize").textContent = fmtSize(t.size || 0) + (t.note ? " · " + t.note : "");
+        $("#cmpresult").hidden = false;
+        loadFiles();
+      }else if(t.state === "error"){
+        clearInterval(gifTimer); gifTimer = null;
+        $("#cmpprog").textContent = "失败";
+        showMsg(t.stage || "压缩失败", "err");
+      }
+    }catch(e){}
+  }, 900);
+}
+
 $("#gifdrop").onclick = () => $("#giffile").click();
 $("#gifdrop").addEventListener("dragover", e => {
   e.preventDefault(); $("#gifdrop").classList.add("over");
@@ -710,19 +865,26 @@ async function handleGifFile(file){
   }
   const fd = new FormData();
   fd.append("file", file, file.name);
-  $("#gifopts").hidden = false;
+  $("#gifopts").hidden = activeMode !== "gif";
+  $("#cmpopts").hidden = activeMode !== "compress";
   $("#gifresult").hidden = true;
+  $("#cmpresult").hidden = true;
   $("#gifreset").hidden = true;
   $("#gifgo").disabled = true;
+  $("#cmpgo").disabled = true;
   $("#gifinfo").textContent = "上传中：" + file.name + "（" + fmtSize(file.size) + "）";
+  $("#cmpinfo").textContent = "上传中：" + file.name + "（" + fmtSize(file.size) + "）";
   try{
     const r = await fetch("/api/upload", {method: "POST", body: fd});
     const d = await r.json();
     if(d.error){ showMsg(d.error, "err"); return; }
     gifFile = d.name;
-    $("#gifinfo").textContent = "已上传：" + d.name + " · " + fmtSize(d.size);
+    const tip = "已上传：" + d.name + " · " + fmtSize(d.size);
+    $("#gifinfo").textContent = tip;
+    $("#cmpinfo").textContent = tip;
     $("#gifreset").hidden = false;
     $("#gifgo").disabled = false;
+    $("#cmpgo").disabled = false;
   }catch(e){
     showMsg("上传失败：" + e.message, "err");
   }
@@ -732,8 +894,10 @@ $("#gifreset").onclick = () => {
   gifFile = null;
   if(gifTimer){ clearInterval(gifTimer); gifTimer = null; }
   $("#gifopts").hidden = true;
+  $("#cmpopts").hidden = true;
   $("#gifreset").hidden = true;
   $("#gifprog").textContent = "";
+  $("#cmpprog").textContent = "";
   $("#giffile").value = "";
 };
 
