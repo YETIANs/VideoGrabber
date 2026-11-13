@@ -196,6 +196,21 @@
   }
   .gifactions{display:flex;align-items:center;gap:12px;margin-top:14px}
   .gifprog{font-size:12px;color:var(--muted)}
+  .giftarget{margin-top:14px;padding-top:12px;border-top:1px solid #f0f0f2}
+  .gifsw{display:flex;align-items:center;gap:7px;font-size:12.5px;color:#3a3a44;cursor:pointer}
+  .gifsw input{width:14px;height:14px;accent-color:#16161a}
+  .giftargetrow{display:flex;align-items:center;gap:8px;margin-top:9px;flex-wrap:wrap}
+  .giftargetrow input{
+    width:96px;height:32px;border:1px solid var(--line);border-radius:8px;
+    padding:0 9px;font-family:inherit;font-size:12.5px;color:var(--text);background:#fff
+  }
+  .gifunit{font-size:12px;color:var(--faint)}
+  .gifquick{display:flex;gap:5px;margin-left:4px}
+  .gifquick button{
+    height:26px;padding:0 9px;border:1px solid var(--line);background:#fff;
+    border-radius:7px;font-family:inherit;font-size:11.5px;color:#4a4a54;cursor:pointer
+  }
+  .gifquick button:hover{border-color:#16161a;color:#16161a}
   .gifresult{
     margin-top:16px;padding-top:14px;border-top:1px solid #f0f0f2;
     display:flex;gap:14px;align-items:flex-start
@@ -331,6 +346,23 @@
         <label>时长（秒）
           <input id="gifdur" type="number" min="0.5" step="0.5" placeholder="全部">
         </label>
+      </div>
+      <div class="giftarget">
+        <label class="gifsw">
+          <input type="checkbox" id="giflimit">
+          <span>限制文件大小，自动压缩到</span>
+        </label>
+        <div class="giftargetrow" id="giftargetrow" hidden>
+          <input id="giftarget" type="number" min="20" step="10" value="500">
+          <span class="gifunit">KB</span>
+          <span class="gifquick">
+            <button type="button" data-kb="200">200</button>
+            <button type="button" data-kb="500">500</button>
+            <button type="button" data-kb="1024">1M</button>
+            <button type="button" data-kb="2048">2M</button>
+            <button type="button" data-kb="5120">5M</button>
+          </span>
+        </div>
       </div>
       <div class="gifactions">
         <button class="btn" id="gifgo">开始转换</button>
@@ -705,20 +737,34 @@ $("#gifreset").onclick = () => {
   $("#giffile").value = "";
 };
 
+$("#giflimit").onchange = e => {
+  const on = e.target.checked;
+  $("#giftargetrow").hidden = !on;
+  $("#gifwidth").disabled = on;
+};
+
+document.querySelectorAll(".gifquick button").forEach(b => {
+  b.onclick = () => { $("#giftarget").value = b.dataset.kb; };
+});
+
 $("#gifgo").onclick = async () => {
   if(!gifFile){ showMsg("先选一个视频", "err"); return; }
   const btn = $("#gifgo");
   btn.disabled = true;
   $("#gifresult").hidden = true;
   $("#gifprog").textContent = "提交中…";
+  const payload = {
+    file: gifFile,
+    fps: +$("#giffps").value,
+    width: +$("#gifwidth").value,
+    start: $("#gifstart").value || null,
+    duration: $("#gifdur").value || null
+  };
+  if($("#giflimit").checked){
+    payload.target_kb = +$("#giftarget").value || 500;
+  }
   try{
-    const d = await api("/api/togif", {
-      file: gifFile,
-      fps: +$("#giffps").value,
-      width: +$("#gifwidth").value,
-      start: $("#gifstart").value || null,
-      duration: $("#gifdur").value || null
-    });
+    const d = await api("/api/togif", payload);
     if(d.error){ showMsg(d.error, "err"); $("#gifprog").textContent = ""; return; }
     pollGif(d.id);
   }catch(e){
@@ -742,7 +788,7 @@ function pollGif(id){
         $("#gifimg").src = url;
         $("#gifdl").href = url;
         $("#gifdl").setAttribute("download", t.file);
-        $("#gifsize").textContent = fmtSize(t.size || 0);
+        $("#gifsize").textContent = fmtSize(t.size || 0) + (t.note ? " · " + t.note : "");
         $("#gifresult").hidden = false;
         loadFiles();
       }else if(t.state === "error"){

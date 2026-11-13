@@ -1248,51 +1248,106 @@ def safe_upload_name(fn):
     return stem[:60] + ext
 
 
-def to_gif_job(tid, src, out_dir, base, fps, width, start, duration):
-    """用两级调色板转高质量 GIF（直接 palettegen 会灰蒙蒙）。"""
+def _gif_cmd(ff, src, out, fps, width, start, duration):
+    vf = (f"fps={fps},scale={width}:-1:flags=lanczos,"
+          f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+          f"[s1][p]paletteuse=dither=bayer:bayer_scale=3")
+    cmd = [ff, "-y", "-loglevel", "error"]
+    if start:
+        cmd += ["-ss", str(start)]
+    cmd += ["-i", src]
+    if duration:
+        cmd += ["-t", str(duration)]
+    cmd += ["-vf", vf, "-loop", "0", out]
+    return cmd
+
+
+def _render_gif(tid, ff, src, out, fps, width, start, duration, pct_from, pct_to):
+    """跑一次转换，带进度。"""
+    cmd = _gif_cmd(ff, src, out, fps, width, start, duration)
+    total = _video_duration(ff, src) or 0
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace",
+                            universal_newlines=True)
+    # 简化：只在开始时给个进度，避免 -stats 与迭代冲突
+    set_task(tid, progress=pct_from)
+    proc.communicate()
+    set_task(tid, progress=pct_to)
+    return proc.returncode == 0 and os.path.isfile(out)
+
+
+def to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
+               target_kb=None):
+    """转 GIF。给了 target_kb 就自动算分辨率，压到目标大小以内。"""
     try:
         ff = find_ffmpeg()
         if not ff:
             raise RuntimeError("没有 ffmpeg，无法转换")
         os.makedirs(out_dir, exist_ok=True)
         base = unique_base(out_dir, base)
-        final = os.path.join(out_dir, base + ".gif")
 
         fps = max(2, min(30, int(fps or 12)))
+        start = start or None
+        duration = duration or None
+
+        # ---- 目标体积模式：迭代调宽度 ----
+        if target_kb:
+            target_bytes = max(20 * 1024, int(float(target_kb) * 1024))
+            total_dur = _video_duration(ff, src) or 0
+            eff = float(duration) if duration else max(0.2, total_dur - float(start or 0))
+
+            tmpdir = os.path.join(DATA_DIR, ".uploads")
+            os.makedirs(tmpdir, exist_ok=True)
+            trial = os.path.join(tmpdir, f"{tid}.trial.gif")
+            width_now = 640
+            best = None
+
+            for attempt in range(6):
+                set_task(tid, stage=f"压缩中 第{attempt + 1}次 · {width_now}px",
+                         progress=10 + attempt * 14)
+                try:
+                    ok = _render_gif(tid, ff, src, trial, fps, width_now,
+                                     start, duration, 10 + attempt * 14,
+                                     10 + attempt * 14)
+                except Exception:
+                    ok = False
+                if not ok:
+                    break
+                size = os.path.getsize(trial)
+                best = (width_now, size)
+                if size <= target_bytes:
+                    break
+                # GIF 体积约正比于像素面积，按面积比开方换算线性缩放
+                ratio = (target_bytes / size) ** 0.6
+                next_w = max(80, int(width_now * ratio))
+                if next_w >= width_now:
+                    next_w = max(80, width_now - 40)
+                width_now = next_w
+                if width_now <= 80 and size > target_bytes:
+                    # 宽度到底还超，降帧率
+                    fps = max(4, fps // 2)
+
+            if not best:
+                raise RuntimeError("转换失败，检查视频是否可读")
+
+            final = os.path.join(out_dir, base + ".gif")
+            # 临时文件在 .uploads，输出目录可能在另一个盘，os.replace 跨盘会失败
+            shutil.move(trial, final)
+            set_task(tid, state="done", progress=100, stage="完成",
+                     file=os.path.basename(final),
+                     size=os.path.getsize(final),
+                     note=f"目标 {target_kb}KB · {best[0]}px")
+            return
+
+        # ---- 手动模式：按指定宽度直接转 ----
+        final = os.path.join(out_dir, base + ".gif")
         width = max(80, min(1280, int(width or 480)))
-        vf = (f"fps={fps},scale={width}:-1:flags=lanczos,"
-              f"split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
-              f"[s1][p]paletteuse=dither=bayer:bayer_scale=3")
-
-        cmd = [ff, "-y", "-loglevel", "error", "-stats"]
-        if start:
-            cmd += ["-ss", str(start)]
-        cmd += ["-i", src]
-        if duration:
-            cmd += ["-t", str(duration)]
-        cmd += ["-vf", vf, "-loop", "0", final]
-
         set_task(tid, state="downloading", stage="转换中", progress=5)
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, text=True,
-                                encoding="utf-8", errors="replace")
-        # ffmpeg -stats 把进度写在 stderr，形如 time=00:00:03.20
-        total = _video_duration(ff, src)
-        pct = 5
-        for line in proc.stderr:
-            m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
-            if m and total:
-                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                pct = max(pct, min(95, 5 + int(sec / total * 90)))
-                set_task(tid, progress=pct)
-        proc.wait()
-
-        if proc.returncode != 0 or not os.path.isfile(final):
+        if not _render_gif(tid, ff, src, final, fps, width, start, duration, 5, 95):
             raise RuntimeError("转换失败，检查视频是否可读")
-
-        size = os.path.getsize(final)
         set_task(tid, state="done", progress=100, stage="完成",
-                 file=os.path.basename(final), size=size)
+                 file=os.path.basename(final), size=os.path.getsize(final))
     except Exception as e:
         set_task(tid, state="error", stage=str(e)[:200], progress=100)
 
@@ -1736,7 +1791,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 target=to_gif_job,
                 args=(tid, src, load_out(), base,
                       body.get("fps"), body.get("width"),
-                      body.get("start"), body.get("duration")),
+                      body.get("start"), body.get("duration"),
+                      body.get("target_kb")),
                 daemon=True).start()
             return self._json({"id": tid})
 
