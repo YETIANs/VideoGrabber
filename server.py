@@ -1414,6 +1414,52 @@ def to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
         set_task(tid, state="error", stage=str(e)[:200], progress=100)
 
 
+# 各输出高度下 H.264 的相对合理最低码率（kbps）。低于这个值画面开始糊、
+# 大面积拖影，再低就成马赛克了——不如直接拒绝，让用户把体积调大。
+MIN_KBPS_BY_HEIGHT = {360: 400, 480: 700, 720: 1200, 1080: 2000,
+                      1440: 3500, 2160: 6000}
+
+
+def _probe_video(ff, path, timeout=20):
+    """读出 (宽, 高, 帧率, 时长)；失败返回全 0。"""
+    try:
+        r = subprocess.run([ff, "-i", path], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        s = r.stderr or ""
+        m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", s)
+        fr = re.search(r"(\d+(?:\.\d+)?)\s*fps", s)
+        dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", s)
+        w = int(m.group(1)) if m else 0
+        h = int(m.group(2)) if m else 0
+        f = float(fr.group(1)) if fr else 0.0
+        d = ((int(dur.group(1)) * 3600 + int(dur.group(2)) * 60 + float(dur.group(3)))
+             if dur else 0.0)
+        return w, h, f, d
+    except Exception:
+        return 0, 0, 0.0, 0.0
+
+
+def _min_video_kbps(height, fps=30):
+    """按目标分辨率和帧率算出可接受的最低视频码率。"""
+    try:
+        h = int(height or 720)
+    except (TypeError, ValueError):
+        h = 720
+    pick = 8000
+    for th in sorted(MIN_KBPS_BY_HEIGHT):
+        if h <= th:
+            pick = MIN_KBPS_BY_HEIGHT[th]
+            break
+    # 高帧率需要更多码率，但不必线性放大
+    try:
+        f = float(fps or 30)
+        if f > 30:
+            pick = int(pick * (f / 30) ** 0.7)
+    except (TypeError, ValueError):
+        pass
+    return pick
+
+
 def compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
     """压缩视频。给了 target_mb 就按目标体积反算码率，否则按 CRF 走质量。
 
@@ -1455,11 +1501,21 @@ def compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
             if total <= 0:
                 raise RuntimeError("读不出视频时长，没法按大小压缩")
             total_kbps = int(target * 1024 * 8 / total)
-            if total_kbps < 120:
-                raise RuntimeError(
-                    f"目标太小：{target:g} MB 对 {total:.0f} 秒视频意味着 {total_kbps}kbps，压不出来")
             audio_kbps = 128 if total_kbps > 700 else (96 if total_kbps > 350 else 64)
             video_kbps = max(60, total_kbps - audio_kbps)
+
+            # 低于该分辨率的合理下限就不干了，避免压出糊成一团的片子
+            need = _min_video_kbps(height, fps)
+            if video_kbps < need:
+                min_mb = (need + audio_kbps) * total / 8 / 1024
+                h_txt = f"{height}p" if height else "原画"
+                f_txt = f"{int(float(fps))}fps" if fps else "原帧率"
+                raise RuntimeError(
+                    f"目标太小，压不出能看的视频：{target:g}MB 分给 {total:.0f} 秒，"
+                    f"视频只能拿到 {video_kbps}kbps，低于 {h_txt}/{f_txt} 的最低要求 {need}kbps。"
+                    f"想保持这个清晰度，体积至少要 {min_mb:.0f}MB；"
+                    f"或者把分辨率调到 480p 以下再试")
+
             cmd += ["-b:v", f"{video_kbps}k",
                     "-maxrate", f"{int(video_kbps * 1.25)}k",
                     "-bufsize", f"{video_kbps * 2}k"]
@@ -1490,6 +1546,20 @@ def compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
 
         if proc.returncode != 0 or not os.path.isfile(final):
             raise RuntimeError("压缩失败，检查视频是否可读")
+
+        # 压完核对：时长、分辨率、帧率得对得上，否则宁可报错也不给坏文件
+        ow, oh, of, od = _probe_video(ff, final)
+        if od <= 0:
+            raise RuntimeError("输出文件读不出来，压缩失败")
+        if total > 2 and abs(od - total) / total > 0.15:
+            raise RuntimeError(
+                f"输出时长异常（源 {total:.1f}s，结果 {od:.1f}s），压缩可能中断了")
+        if height and abs(oh - int(height)) > 4:
+            raise RuntimeError(
+                f"输出分辨率不对（要求 {height}p，实际 {oh}p），请重试")
+        if fps and of > 0 and abs(of - float(fps)) > 2:
+            raise RuntimeError(
+                f"输出帧率不对（要求 {int(float(fps))}fps，实际 {of:.1f}fps），请重试")
 
         set_task(tid, state="done", progress=100, stage="完成",
                  file=os.path.basename(final),
