@@ -1237,6 +1237,21 @@ def save_stream(url, dest, on_progress=None):
         mode = "ab" if resumed else "wb"
         base = have if resumed else 0
         total = base + int(r.headers.get("Content-Length") or 0)
+
+        # 空间不够就别开写，免得下到一半失败还留个半截文件
+        need = total - base
+        if need > 0:
+            try:
+                free = shutil.disk_usage(os.path.dirname(dest) or ".").free
+                if need > free - 200 * 1024 * 1024:
+                    raise RuntimeError(
+                        f"磁盘空间不足：这个文件还需要 {need / 1024 ** 3:.2f} GB，"
+                        f"但目标盘只剩 {free / 1024 ** 3:.2f} GB")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
         got = base
         with open(dest, mode) as f:
             while True:
@@ -1250,6 +1265,7 @@ def save_stream(url, dest, on_progress=None):
 
 
 TASK_SEM = threading.Semaphore(2)   # 同时最多跑 2 个 ffmpeg 任务，多了打满 CPU
+DL_SEM = threading.Semaphore(3)     # 下载是 IO 密集型，可以比转码多几个
 
 PROCS = {}          # tid -> Popen，用于中途取消
 CANCELLED = set()   # 被用户取消的 tid
@@ -1345,28 +1361,6 @@ def upload_dir():
         except Exception:
             pass
     return d
-
-
-def parse_multipart(body, content_type):
-    """极简 multipart/form-data 解析，取第一个带文件名的字段。"""
-    m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type or "")
-    if not m:
-        return None, None
-    boundary = (m.group(1) or m.group(2)).strip().encode()
-    sep = b"--" + boundary
-    for chunk in body.split(sep)[1:]:
-        if chunk.startswith(b"--"):
-            break
-        head, _, data = chunk.partition(b"\r\n\r\n")
-        if not data:
-            continue
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
-        hdr = head.decode("utf-8", "replace")
-        fm = re.search(r'filename="([^"]*)"', hdr)
-        if fm and fm.group(1):
-            return fm.group(1), data
-    return None, None
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v", ".ts", ".wmv"}
@@ -1693,6 +1687,11 @@ def _video_duration(ff, path, timeout=20):
 
 
 def run_job(tid, video_url, audio_url, mp4_url, name, kind="video"):
+    with DL_SEM:
+        _run_job(tid, video_url, audio_url, mp4_url, name, kind)
+
+
+def _run_job(tid, video_url, audio_url, mp4_url, name, kind="video"):
     out = load_out()
     parts = os.path.join(out, ".parts")
     try:
@@ -1799,12 +1798,18 @@ def parse_via_site(url, extracted):
         return None
     videos, audios, mp4s = classify(links)
     title = fetch_title(url)
-    return {"ok": True, "url": url, "extracted": extracted, "via": "site",
-            "title": title or "", "videos": videos, "audios": audios,
-            "mp4s": mp4s,
-            "suggest": safe_name(title) if title else suggest_name(url),
-            "best": (videos[0]["label"] if videos else
-                     (mp4s[0]["label"] if mp4s else "未知"))}
+    out = {"ok": True, "url": url, "extracted": extracted, "via": "site",
+           "title": title or "", "videos": videos, "audios": audios,
+           "mp4s": mp4s,
+           "suggest": safe_name(title) if title else suggest_name(url),
+           "best": (videos[0]["label"] if videos else
+                    (mp4s[0]["label"] if mp4s else "未知"))}
+    # 只有音频没有视频，多半是平台要 cookie 了，别让用户以为下到了正片
+    if not videos and not mp4s:
+        out["warning"] = ("只解析到音频，视频流没拿到。抖音、小红书这类平台现在需要 cookie，"
+                          "先点「装插件」导出一次再导入") if audios else \
+                         "没解析到可下载的内容，链接可能失效，或者这个平台需要 cookie"
+    return out
 
 
 def parse_via_ytdlp(url, extracted):
@@ -1813,10 +1818,14 @@ def parse_via_ytdlp(url, extracted):
         return None
     vids, auds = ytdlp_options(info)
     title = (info.get("title") or "").strip() or None
-    return {"ok": True, "url": url, "extracted": extracted, "via": "ytdlp",
-            "title": title or "", "videos": vids, "audios": auds, "mp4s": [],
-            "suggest": safe_name(title) if title else suggest_name(url),
-            "best": vids[0]["label"] if vids else "未知"}
+    out = {"ok": True, "url": url, "extracted": extracted, "via": "ytdlp",
+           "title": title or "", "videos": vids, "audios": auds, "mp4s": [],
+           "suggest": safe_name(title) if title else suggest_name(url),
+           "best": vids[0]["label"] if vids else "未知"}
+    if not vids and not auds:
+        out["warning"] = ("这个平台没返回可下载的格式，通常是缺 cookie。"
+                          "点「装插件」导出一次登录状态再试")
+    return out
 
 
 def _has_cookie_for(domain):

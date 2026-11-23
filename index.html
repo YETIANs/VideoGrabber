@@ -628,6 +628,7 @@ async function doParse(){
       showMsg("已从分享文字里认出链接：" + d.url, "info");
     }
     cur = d;
+    if(d.warning) showMsg(d.warning, "err");
     const vt = $("#vtitle");
     if(d.title){ vt.textContent = d.title; vt.classList.add("on"); }
     else { vt.textContent = ""; vt.classList.remove("on"); }
