@@ -1234,6 +1234,47 @@ def save_stream(url, dest, on_progress=None):
                 on_progress(got, total)
 
 
+TASK_SEM = threading.Semaphore(2)   # 同时最多跑 2 个 ffmpeg 任务，多了打满 CPU
+
+
+def _clean_uploads(max_age_h=24):
+    """清掉上传目录里放太久的文件。
+
+    上传的原片和转换中间产物都在这里，不及时清会一直涨——
+    实测一天能堆到 1.7 GB。
+    """
+    try:
+        d = upload_dir()
+        now = time.time()
+        removed = 0
+        freed = 0
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if not os.path.isfile(p):
+                continue
+            try:
+                age = now - os.path.getmtime(p)
+                # 中断的上传残留（.incoming_*）1 小时就清
+                limit = 3600 if name.startswith(".incoming") else max_age_h * 3600
+                if age > limit:
+                    freed += os.path.getsize(p)
+                    os.remove(p)
+                    removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(f"[clean] 清理上传缓存 {removed} 个文件，释放 {freed / 1024 ** 2:.1f} MB")
+    except Exception:
+        pass
+
+
+def _upload_janitor():
+    """后台每小时清一次上传缓存。"""
+    while True:
+        time.sleep(3600)
+        _clean_uploads()
+
+
 def set_task(tid, **kw):
     with LOCK:
         TASKS.setdefault(tid, {}).update(kw)
@@ -1342,6 +1383,12 @@ def _render_gif(tid, ff, src, out, fps, width, start, duration, pct_from, pct_to
 def to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
                target_kb=None):
     """转 GIF。给了 target_kb 就自动算分辨率，压到目标大小以内。"""
+    with TASK_SEM:
+        _to_gif_job(tid, src, out_dir, base, fps, width, start, duration, target_kb)
+
+
+def _to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
+                target_kb=None):
     try:
         ff = find_ffmpeg()
         if not ff:
@@ -1465,6 +1512,11 @@ def compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
 
     target_mb 是"目标体积"，单位 MB（前端会把 KB/GB 换算好再传）。
     """
+    with TASK_SEM:
+        _compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb)
+
+
+def _compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
     try:
         ff = find_ffmpeg()
         if not ff:
@@ -2258,6 +2310,10 @@ def main():
             sys.stderr.reconfigure(encoding="utf-8")
         except Exception:
             pass
+
+    # 启动时清一次上传缓存，之后每小时清一次
+    _clean_uploads()
+    threading.Thread(target=_upload_janitor, daemon=True).start()
 
     port = PORT
     for _ in range(12):
