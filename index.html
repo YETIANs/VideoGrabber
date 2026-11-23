@@ -247,6 +247,18 @@
   .cmpunit{height:32px;border:1px solid var(--line);border-radius:8px;padding:0 6px;
     font-family:inherit;font-size:12.5px;color:var(--text);background:#fff}
   .cmphint{font-size:12px;color:var(--faint);height:32px;display:flex;align-items:center}
+  .preview{margin-bottom:14px}
+  .preview video{
+    width:100%;max-height:320px;background:#000;border-radius:10px;
+    display:block;outline:none
+  }
+  .pvbar{
+    display:flex;align-items:center;gap:10px;margin-top:8px;
+    font-size:11.5px;color:var(--faint);flex-wrap:wrap
+  }
+  .pvtime{font-variant-numeric:tabular-nums;color:#4a4a54}
+  .pvbtns{display:flex;gap:6px;margin-left:auto}
+  body.dark .pvtime{color:#b8b8c4}
   .upcache{margin-top:16px;padding-top:14px;border-top:1px solid #f0f0f2}
   .uphead{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--faint)}
   .uphead span:first-child{color:#4a4a54}
@@ -509,6 +521,17 @@
 
     <div class="gifopts" id="trimopts" hidden>
       <div class="gifinfo" id="triminfo"></div>
+      <div class="preview">
+        <video id="trimvideo" controls preload="metadata"></video>
+        <div class="pvbar">
+          <span class="pvtime" id="pvtime">00:00 / 00:00</span>
+          <span class="pvbtns">
+            <button type="button" class="btn ghost sm" id="pvstart">标记起点</button>
+            <button type="button" class="btn ghost sm" id="pvend">标记终点</button>
+            <button type="button" class="btn ghost sm" id="pvclear">清除</button>
+          </span>
+        </div>
+      </div>
       <div class="gifrow">
         <label>开始（秒）
           <input id="trimstart" type="number" min="0" step="0.1" placeholder="0">
@@ -894,6 +917,57 @@ document.addEventListener("drop", e => {
   };
 })();
 
+// ---------- 裁剪预览器 ----------
+function fmtTime(x){
+  if(!isFinite(x) || x < 0) return "00:00";
+  const m = Math.floor(x / 60), sec = Math.floor(x % 60);
+  return String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+}
+
+function loadPreview(){
+  const v = $("#trimvideo");
+  if(!v) return;
+  if(!gifFile){ v.removeAttribute("src"); v.load(); return; }
+  const src = "/preview?n=" + encodeURIComponent(gifFile);
+  if(v.getAttribute("src") !== src){
+    v.src = src;
+    try{ v.load(); }catch(e){}
+  }
+  $("#pvtime").textContent = "00:00 / 00:00";
+}
+
+(function(){
+  const v = $("#trimvideo");
+  if(!v) return;
+  const upd = () => {
+    $("#pvtime").textContent =
+      fmtTime(v.currentTime) + " / " + fmtTime(v.duration || 0);
+  };
+  v.addEventListener("loadedmetadata", upd);
+  v.addEventListener("timeupdate", upd);
+
+  $("#pvstart").onclick = () => {
+    const t = v.currentTime;
+    $("#trimstart").value = t.toFixed(1);
+    const d = +$("#trimdur").value;
+    if(d && t + d > (v.duration || 1e9)) $("#trimdur").value = "";
+    showMsg("起点 " + t.toFixed(1) + " 秒", "info");
+  };
+  $("#pvend").onclick = () => {
+    const st = +$("#trimstart").value || 0;
+    const t = v.currentTime;
+    if(t <= st + 0.2){ showMsg("终点要在起点之后（当前 " + t.toFixed(1) + "s）", "err"); return; }
+    $("#trimdur").value = (t - st).toFixed(1);
+    showMsg("截取 " + st.toFixed(1) + "s → " + t.toFixed(1) + "s，共 " + (t - st).toFixed(1) + " 秒", "info");
+  };
+  $("#pvclear").onclick = () => {
+    $("#trimstart").value = "";
+    $("#trimdur").value = "";
+    v.currentTime = 0;
+    showMsg("已清除起止点", "info");
+  };
+})();
+
 $("#url").focus(); }
   }catch(e){
     showMsg("浏览器不允许读取剪贴板，直接 Ctrl+V 粘贴即可", "info");
@@ -1088,6 +1162,7 @@ function showOpts(){
   if(gifFile && OPTS_MAP[activeMode]){
     const el = $(OPTS_MAP[activeMode]);
     if(el) el.hidden = false;
+    if(activeMode === "trim" && typeof loadPreview === "function") loadPreview();
   }
 }
 

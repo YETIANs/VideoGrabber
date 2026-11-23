@@ -2054,6 +2054,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream(self, path, mime="video/mp4", name=None):
+        """支持 Range 的发送，浏览器里 <video> 才能拖动进度条。"""
+        size = os.path.getsize(path)
+        start, end = 0, size - 1
+        partial = False
+        m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range") or "")
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                if m.group(2):
+                    end = min(int(m.group(2)), size - 1)
+            else:
+                start = max(0, size - int(m.group(2)))
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            partial = True
+
+        length = end - start + 1
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        if name:
+            self.send_header(
+                "Content-Disposition",
+                "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    chunk = f.read(min(262144, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _file(self, path, name=None, mime="application/octet-stream"):
         size = os.path.getsize(path)
         self.send_response(200)
@@ -2288,6 +2333,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not t:
                 return self._json({"error": "not found"}, 404)
             return self._json(t)
+
+        if p.path == "/preview":
+            fn = os.path.basename((q.get("n") or [""])[0])
+            fp = os.path.join(upload_dir(), fn)
+            if not os.path.isfile(fp):
+                return self._json({"error": "not found"}, 404)
+            ext = os.path.splitext(fn)[1].lower()
+            mime = {".mp4": "video/mp4", ".m4v": "video/mp4",
+                    ".webm": "video/webm", ".mov": "video/quicktime",
+                    ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+                    ".ts": "video/mp2t", ".flv": "video/x-flv",
+                    ".wmv": "video/x-ms-wmv"}.get(ext, "application/octet-stream")
+            return self._stream(fp, mime)
 
         if p.path == "/file":
             fn = os.path.basename((q.get("n") or [""])[0])
