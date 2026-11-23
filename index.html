@@ -379,6 +379,7 @@
       </div>
       <div class="gifactions">
         <button class="btn" id="gifgo">开始转换</button>
+        <button class="btn ghost sm" id="gifcancel" hidden>取消</button>
         <span class="gifprog" id="gifprog"></span>
       </div>
       <div class="gifresult" id="gifresult" hidden>
@@ -445,6 +446,7 @@
       </div>
       <div class="gifactions">
         <button class="btn" id="cmpgo">开始压缩</button>
+        <button class="btn ghost sm" id="cmpcancel" hidden>取消</button>
         <span class="gifprog" id="cmpprog"></span>
       </div>
       <div class="gifresult" id="cmpresult" hidden>
@@ -509,6 +511,22 @@ async function loadEnv(){
       if(el) el.textContent = d.upload_max_gb;
     }
     if(!d.ffmpeg) $("#hint").textContent = "未检测到 ffmpeg · 只能下载单文件版画质";
+  }catch(e){}
+
+  // 刷新页面后接管还在跑的任务
+  try{
+    const tr = await (await fetch("/api/tasks")).json();
+    const list = tr.tasks || [];
+    if(list.length){
+      const t = list[list.length - 1];
+      if(t.kind === "gif"){
+        $("#gifopts").hidden = false;
+        pollGif(t.id);
+      }else if(t.kind === "video"){
+        $("#cmpopts").hidden = false;
+        pollCmp(t.id);
+      }
+    }
   }catch(e){}
 }
 
@@ -825,12 +843,19 @@ $("#cmpgo").onclick = async () => {
 
 function pollCmp(id){
   if(gifTimer) clearInterval(gifTimer);
+  $("#cmpcancel").hidden = false;
+  $("#cmpcancel").onclick = async () => {
+    try{ await api("/api/cancel", {id}); }catch(e){}
+    $("#cmpcancel").hidden = true;
+    $("#cmpprog").textContent = "已取消";
+  };
   gifTimer = setInterval(async () => {
     try{
       const t = await (await fetch("/api/task?id=" + id)).json();
       $("#cmpprog").textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
       if(t.state === "done"){
         clearInterval(gifTimer); gifTimer = null;
+        $("#cmpcancel").hidden = true;
         $("#cmpprog").textContent = "完成";
         const url = "/file?n=" + encodeURIComponent(t.file);
         $("#cmpdl").href = url;
@@ -840,6 +865,7 @@ function pollCmp(id){
         loadFiles();
       }else if(t.state === "error"){
         clearInterval(gifTimer); gifTimer = null;
+        $("#cmpcancel").hidden = true;
         $("#cmpprog").textContent = "失败";
         showMsg(t.stage || "压缩失败", "err");
       }
@@ -882,18 +908,38 @@ async function handleGifFile(file){
   $("#gifinfo").textContent = "上传中：" + file.name + "（" + fmtSize(file.size) + "）";
   $("#cmpinfo").textContent = "上传中：" + file.name + "（" + fmtSize(file.size) + "）";
   try{
-    const r = await fetch("/api/upload", {method: "POST", body: fd});
-    const d = await r.json();
-    if(d.error){ showMsg(d.error, "err"); return; }
-    gifFile = d.name;
-    const tip = "已上传：" + d.name + " · " + fmtSize(d.size);
-    $("#gifinfo").textContent = tip;
-    $("#cmpinfo").textContent = tip;
-    $("#gifreset").hidden = false;
-    $("#gifgo").disabled = false;
-    $("#cmpgo").disabled = false;
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+      xhr.upload.onprogress = ev => {
+        if(!ev.lengthComputable) return;
+        const pct = Math.round(ev.loaded / ev.total * 100);
+        const tip = "上传中 " + pct + "%（" + fmtSize(ev.loaded) + " / " + fmtSize(ev.total) + "）";
+        $("#gifinfo").textContent = tip;
+        $("#cmpinfo").textContent = tip;
+      };
+      xhr.onload = () => {
+        let d;
+        try{ d = JSON.parse(xhr.responseText); }
+        catch(e){ return reject(new Error("服务器返回异常")); }
+        if(d.error){ showMsg(d.error, "err"); return resolve(); }
+        gifFile = d.name;
+        const tip = "已上传：" + d.name + " · " + fmtSize(d.size);
+        $("#gifinfo").textContent = tip;
+        $("#cmpinfo").textContent = tip;
+        $("#gifreset").hidden = false;
+        $("#gifgo").disabled = false;
+        $("#cmpgo").disabled = false;
+        resolve();
+      };
+      xhr.onerror = () => reject(new Error("网络中断"));
+      xhr.ontimeout = () => reject(new Error("上传超时"));
+      xhr.send(fd);
+    });
   }catch(e){
     showMsg("上传失败：" + e.message, "err");
+    $("#gifgo").disabled = false;
+    $("#cmpgo").disabled = false;
   }
 }
 
@@ -948,12 +994,19 @@ $("#gifgo").onclick = async () => {
 
 function pollGif(id){
   if(gifTimer) clearInterval(gifTimer);
+  $("#gifcancel").hidden = false;
+  $("#gifcancel").onclick = async () => {
+    try{ await api("/api/cancel", {id}); }catch(e){}
+    $("#gifcancel").hidden = true;
+    $("#gifprog").textContent = "已取消";
+  };
   gifTimer = setInterval(async () => {
     try{
       const t = await (await fetch("/api/task?id=" + id)).json();
       $("#gifprog").textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
       if(t.state === "done"){
         clearInterval(gifTimer); gifTimer = null;
+        $("#gifcancel").hidden = true;
         $("#gifprog").textContent = "完成";
         const url = "/file?n=" + encodeURIComponent(t.file);
         $("#gifimg").src = url;
@@ -964,6 +1017,7 @@ function pollGif(id){
         loadFiles();
       }else if(t.state === "error"){
         clearInterval(gifTimer); gifTimer = null;
+        $("#gifcancel").hidden = true;
         $("#gifprog").textContent = "失败";
         showMsg(t.stage || "转换失败", "err");
       }

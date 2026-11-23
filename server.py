@@ -1220,21 +1220,52 @@ def find_ffmpeg():
 
 
 def save_stream(url, dest, on_progress=None):
+    """下载到 dest。文件已存在且有内容时用 Range 续传，断网不用从头来。"""
+    have = os.path.getsize(dest) if os.path.isfile(dest) else 0
     req = urllib.request.Request(url, headers=cdn_headers(url))
-    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        got = 0
-        while True:
-            chunk = r.read(262144)
-            if not chunk:
-                break
-            f.write(chunk)
-            got += len(chunk)
-            if on_progress:
-                on_progress(got, total)
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    try:
+        r = urllib.request.urlopen(req, timeout=120)
+    except urllib.error.HTTPError as e:
+        if e.code == 416:          # 已经有全量了
+            return
+        raise
+
+    with r:
+        resumed = have and r.getcode() == 206
+        mode = "ab" if resumed else "wb"
+        base = have if resumed else 0
+        total = base + int(r.headers.get("Content-Length") or 0)
+        got = base
+        with open(dest, mode) as f:
+            while True:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if on_progress:
+                    on_progress(got, total)
 
 
 TASK_SEM = threading.Semaphore(2)   # 同时最多跑 2 个 ffmpeg 任务，多了打满 CPU
+
+PROCS = {}          # tid -> Popen，用于中途取消
+CANCELLED = set()   # 被用户取消的 tid
+
+
+def _kill_task(tid):
+    """杀掉正在跑的任务进程。返回是否真的杀掉了。"""
+    p = PROCS.get(tid)
+    if not p or p.poll() is not None:
+        return False
+    CANCELLED.add(tid)
+    try:
+        p.kill()
+        return True
+    except Exception:
+        return False
 
 
 def _clean_uploads(max_age_h=24):
@@ -1373,9 +1404,14 @@ def _render_gif(tid, ff, src, out, fps, width, start, duration, pct_from, pct_to
                             stderr=subprocess.PIPE, text=True,
                             encoding="utf-8", errors="replace",
                             universal_newlines=True)
+    PROCS[tid] = proc
     # 简化：只在开始时给个进度，避免 -stats 与迭代冲突
     set_task(tid, progress=pct_from)
     proc.communicate()
+    PROCS.pop(tid, None)
+    if tid in CANCELLED:
+        CANCELLED.discard(tid)
+        raise RuntimeError("已取消")
     set_task(tid, progress=pct_to)
     return proc.returncode == 0 and os.path.isfile(out)
 
@@ -1443,6 +1479,7 @@ def _to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
             final = os.path.join(out_dir, base + ".gif")
             # 临时文件在 .uploads，输出目录可能在另一个盘，os.replace 跨盘会失败
             shutil.move(trial, final)
+            _verify_gif(ff, final, best[0], eff)
             set_task(tid, state="done", progress=100, stage="完成",
                      file=os.path.basename(final),
                      size=os.path.getsize(final),
@@ -1455,10 +1492,26 @@ def _to_gif_job(tid, src, out_dir, base, fps, width, start, duration,
         set_task(tid, state="downloading", stage="转换中", progress=5)
         if not _render_gif(tid, ff, src, final, fps, width, start, duration, 5, 95):
             raise RuntimeError("转换失败，检查视频是否可读")
+        want = float(duration) if duration else max(0.2, (_video_duration(ff, src) or 0) - float(start or 0))
+        _verify_gif(ff, final, width, want)
         set_task(tid, state="done", progress=100, stage="完成",
                  file=os.path.basename(final), size=os.path.getsize(final))
     except Exception as e:
         set_task(tid, state="error", stage=str(e)[:200], progress=100)
+
+
+def _verify_gif(ff, path, expect_width=None, expect_dur=None):
+    """GIF 也需要核对，避免静默产出坏文件。"""
+    w, h, _, d = _probe_video(ff, path)
+    if d <= 0 or w <= 0 or h <= 0:
+        raise RuntimeError("GIF 输出读不出来，转换失败")
+    if os.path.getsize(path) < 1024:
+        raise RuntimeError("GIF 文件过小，转换失败")
+    if expect_width and abs(w - int(expect_width)) > 8:
+        raise RuntimeError(f"GIF 宽度不对（要求 {int(expect_width)}px，实际 {w}px）")
+    if expect_dur and expect_dur > 1.5 and abs(d - expect_dur) / expect_dur > 0.3:
+        raise RuntimeError(
+            f"GIF 时长异常（预期 {expect_dur:.1f}s，实际 {d:.1f}s），转换可能中断")
 
 
 # 各输出高度下 H.264 的相对合理最低码率（kbps）。低于这个值画面开始糊、
@@ -1587,6 +1640,7 @@ def _compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True,
                                 encoding="utf-8", errors="replace")
+        PROCS[tid] = proc
         pct = 3
         for line in proc.stderr:
             m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
@@ -1595,6 +1649,10 @@ def _compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
                 pct = max(pct, min(97, 3 + int(sec / total * 94)))
                 set_task(tid, progress=pct)
         proc.wait()
+        PROCS.pop(tid, None)
+        if tid in CANCELLED:
+            CANCELLED.discard(tid)
+            raise RuntimeError("已取消")
 
         if proc.returncode != 0 or not os.path.isfile(final):
             raise RuntimeError("压缩失败，检查视频是否可读")
@@ -1932,6 +1990,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             html = os.path.join(RES_DIR, "index.html")
             return self._file(html, None, "text/html; charset=utf-8")
 
+        if p.path == "/api/tasks":
+            # 刷新页面后用来恢复正在跑的任务
+            with LOCK:
+                live = [dict(id=k, **v) for k, v in TASKS.items()
+                        if v.get("state") not in ("done", "error")]
+            live.sort(key=lambda x: x.get("progress") or 0)
+            return self._json({"tasks": live})
+
         if p.path == "/api/env":
             return self._json({"ffmpeg": bool(find_ffmpeg()), "out": load_out(),
                                "default": DEFAULT_OUT,
@@ -2109,6 +2175,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"ok": True, "count": len(items),
                                "status": cookie_status()})
 
+        if p.path == "/api/cancel":
+            tid = str(body.get("id") or "")
+            if _kill_task(tid):
+                set_task(tid, state="error", stage="已取消", progress=100)
+                return self._json({"ok": True})
+            t = TASKS.get(tid) or {}
+            if t.get("state") in ("done", "error"):
+                return self._json({"error": "任务已结束"}, 400)
+            return self._json({"error": "任务不在运行"}, 400)
+
         if p.path == "/api/compress":
             fn = os.path.basename(body.get("file") or "")
             src = os.path.join(upload_dir(), fn)
@@ -2116,7 +2192,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": "先上传一个视频"}, 400)
             base = os.path.splitext(fn)[0] + "_compressed"
             tid = hashlib.md5(f"c{time.time()}{fn}".encode()).hexdigest()[:12]
-            set_task(tid, state="queued", stage="排队中", progress=0)
+            set_task(tid, state="queued", stage="排队中", progress=0, kind="video")
             threading.Thread(
                 target=compress_video_job,
                 args=(tid, src, load_out(), base,
@@ -2132,7 +2208,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": "先上传一个视频"}, 400)
             base = os.path.splitext(fn)[0]
             tid = hashlib.md5(f"{time.time()}{fn}".encode()).hexdigest()[:12]
-            set_task(tid, state="queued", stage="排队中", progress=0)
+            set_task(tid, state="queued", stage="排队中", progress=0, kind="gif")
             threading.Thread(
                 target=to_gif_job,
                 args=(tid, src, load_out(), base,
