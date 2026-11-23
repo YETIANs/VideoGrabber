@@ -54,8 +54,11 @@ def write_version(ver):
 
 
 def main():
-    ver = sys.argv[1] if len(sys.argv) > 1 else None
-    title = sys.argv[2] if len(sys.argv) > 2 else None
+    raw = sys.argv[1:]
+    notes_file = next((a.split("=", 1)[1] for a in raw if a.startswith("--notes=")), None)
+    pos = [a for a in raw if not a.startswith("--")]
+    ver = pos[0] if len(pos) > 0 else None
+    title = pos[1] if len(pos) > 1 else None
 
     if ver:
         write_version(ver)
@@ -107,7 +110,12 @@ def main():
     # 6. Release
     subprocess.run(["gh", "release", "delete", tag, "-y"], cwd=ROOT,
                    capture_output=True)          # 已存在就先删，保证幂等
-    notes = f"版本 {ver}，详见 commit 记录。\n\n安装：下载 `{os.path.basename(setup)}` 双击安装，覆盖安装保留配置和数据。"
+    if notes_file and os.path.isfile(notes_file):
+        with open(notes_file, encoding="utf-8") as f:
+            notes = f.read()
+    else:
+        notes = (f"版本 {ver}，详见 commit 记录。\n\n"
+                 f"安装：下载 `{os.path.basename(setup)}` 双击安装，覆盖安装保留配置和数据。")
     run(["gh", "release", "create", tag, "--title", title,
          "--notes", notes, setup])
 
