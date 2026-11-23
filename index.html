@@ -182,6 +182,7 @@
   .drop:hover,.drop.over{border-color:#16161a;background:#f4f4f6}
   .dropinner b{display:block;font-size:13px;color:var(--text);font-weight:500;margin-bottom:4px}
   .dropinner span{font-size:11.5px;color:var(--faint)}
+  .nw{white-space:nowrap;display:inline}
   .gifopts{margin-top:14px}
   .gifinfo{
     font-size:12px;color:#4a4a54;background:#f7f7f9;border-radius:8px;
@@ -220,6 +221,23 @@
   .cmpunit{height:32px;border:1px solid var(--line);border-radius:8px;padding:0 6px;
     font-family:inherit;font-size:12.5px;color:var(--text);background:#fff}
   .cmphint{font-size:12px;color:var(--faint);height:32px;display:flex;align-items:center}
+  .upcache{margin-top:16px;padding-top:14px;border-top:1px solid #f0f0f2}
+  .uphead{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--faint)}
+  .uphead span:first-child{color:#4a4a54}
+  .upsize{flex:1}
+  .upfiles{list-style:none;margin:8px 0 0;padding:0;max-height:180px;overflow-y:auto}
+  .upfiles li{
+    display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:7px;
+    font-size:12px;color:#4a4a54
+  }
+  .upfiles li:hover{background:#f7f7f9}
+  .upfiles .un{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .upfiles .us{color:var(--faint);font-size:11.5px;white-space:nowrap}
+  .upfiles .ud{
+    border:0;background:transparent;color:#c23b3b;font-size:11.5px;
+    cursor:pointer;padding:2px 6px;border-radius:5px;font-family:inherit
+  }
+  .upfiles .ud:hover{background:#fdeaea}
   .gifresult{
     margin-top:16px;padding-top:14px;border-top:1px solid #f0f0f2;
     display:flex;gap:14px;align-items:flex-start
@@ -331,7 +349,7 @@
       <input type="file" id="giffile" accept="video/*" hidden>
       <div class="dropinner">
         <b>把视频拖进来</b>
-        <span>或点这里选择文件 · mp4 / mov / mkv / webm / avi，最大 <b id="maxup">8</b> GB</span>
+        <span>或点这里选择文件 · mp4 / mov / mkv / webm / avi，最大 <b id="maxup" class="nw">8</b><span class="nw"> GB</span></span>
       </div>
     </div>
     <div class="gifopts" id="gifopts" hidden>
@@ -468,6 +486,15 @@
       <button class="btn ghost sm" id="pickdir">浏览</button>
     </div>
     <div class="chips" id="chips"></div>
+
+    <div class="upcache">
+      <div class="uphead">
+        <span>上传缓存</span>
+        <span class="upsize" id="upsize">读取中…</span>
+        <button class="btn ghost sm" id="upclear" hidden>全部删除</button>
+      </div>
+      <ul class="upfiles" id="upfiles"></ul>
+    </div>
   </section>
 
   <footer>所有解析和下载都在这台电脑上完成 · 不上传任何数据 · 关闭命令行窗口即停止服务</footer>
@@ -528,7 +555,39 @@ async function loadEnv(){
       }
     }
   }catch(e){}
+
+  loadUploads();
 }
+
+async function loadUploads(){
+  try{
+    const d = await (await fetch("/api/uploads")).json();
+    const files = d.files || [];
+    $("#upsize").textContent = files.length
+      ? files.length + " 个 · " + fmtSize(d.total || 0)
+      : "空";
+    $("#upclear").hidden = !files.length;
+    const box = $("#upfiles");
+    box.innerHTML = files.map(f =>
+      '<li data-n="' + esc(f.name) + '">'
+      + '<span class="un" title="' + esc(f.name) + '">' + esc(f.name) + '</span>'
+      + '<span class="us">' + fmtSize(f.size) + '</span>'
+      + '<button class="ud">删除</button></li>').join("");
+    box.querySelectorAll("li").forEach(li => {
+      li.querySelector(".ud").onclick = async () => {
+        li.style.opacity = ".4";
+        try{ await api("/api/uploads/delete", {names: [li.dataset.n]}); }catch(e){}
+        loadUploads();
+      };
+    });
+  }catch(e){}
+}
+
+$("#upclear").onclick = async () => {
+  if(!confirm("删除全部上传缓存？\n\n这里只是上传产生的副本，你电脑里的原片不受影响。")) return;
+  try{ await api("/api/uploads/delete", {all: true}); }catch(e){}
+  loadUploads();
+};
 
 function renderPlaces(places){
   const box = $("#chips");
@@ -931,6 +990,7 @@ async function handleGifFile(file){
         $("#gifreset").hidden = false;
         $("#gifgo").disabled = false;
         $("#cmpgo").disabled = false;
+        loadUploads();
         resolve();
       };
       xhr.onerror = () => reject(new Error("网络中断"));

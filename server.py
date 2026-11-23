@@ -1999,6 +1999,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             html = os.path.join(RES_DIR, "index.html")
             return self._file(html, None, "text/html; charset=utf-8")
 
+        if p.path == "/api/uploads":
+            try:
+                d = upload_dir()
+                items, total = [], 0
+                for n in os.listdir(d):
+                    fp = os.path.join(d, n)
+                    if not os.path.isfile(fp) or n.startswith("."):
+                        continue
+                    sz = os.path.getsize(fp)
+                    total += sz
+                    items.append({"name": n, "size": sz,
+                                  "mtime": int(os.path.getmtime(fp))})
+                items.sort(key=lambda x: -x["mtime"])
+                return self._json({"files": items, "total": total, "dir": d})
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+
         if p.path == "/api/tasks":
             # 刷新页面后用来恢复正在跑的任务
             with LOCK:
@@ -2183,6 +2200,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json({"error": f"写入失败：{e}"}, 500)
             return self._json({"ok": True, "count": len(items),
                                "status": cookie_status()})
+
+        if p.path == "/api/uploads/delete":
+            d = upload_dir()
+            if body.get("all"):
+                names = [n for n in os.listdir(d)
+                         if os.path.isfile(os.path.join(d, n)) and not n.startswith(".")]
+            else:
+                names = body.get("names") or []
+            freed, removed = 0, []
+            for n in names:
+                safe = os.path.basename(str(n))     # 防路径穿越
+                fp = os.path.join(d, safe)
+                if os.path.isfile(fp):
+                    try:
+                        freed += os.path.getsize(fp)
+                        os.remove(fp)
+                        removed.append(safe)
+                    except OSError:
+                        pass
+            return self._json({"ok": True, "removed": removed, "freed": freed})
 
         if p.path == "/api/cancel":
             tid = str(body.get("id") or "")
