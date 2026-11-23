@@ -522,7 +522,7 @@
     <div class="gifopts" id="trimopts" hidden>
       <div class="gifinfo" id="triminfo"></div>
       <div class="preview">
-        <video id="trimvideo" controls preload="metadata"></video>
+        <video id="trimvideo" controls preload="auto" playsinline></video>
         <div class="pvbar">
           <span class="pvtime" id="pvtime">00:00 / 00:00</span>
           <span class="pvbtns">
@@ -928,7 +928,9 @@ function loadPreview(){
   const v = $("#trimvideo");
   if(!v) return;
   if(!gifFile){ v.removeAttribute("src"); v.load(); return; }
-  const src = "/preview?n=" + encodeURIComponent(gifFile);
+  // 带 #t=0.1，浏览器会 seek 到 0.1 秒并把那一帧画出来，
+  // 否则 preload 只拿元数据，画面是黑的
+  const src = "/preview?n=" + encodeURIComponent(gifFile) + "#t=0.1";
   if(v.getAttribute("src") !== src){
     v.src = src;
     try{ v.load(); }catch(e){}
@@ -943,7 +945,12 @@ function loadPreview(){
     $("#pvtime").textContent =
       fmtTime(v.currentTime) + " / " + fmtTime(v.duration || 0);
   };
-  v.addEventListener("loadedmetadata", upd);
+  v.addEventListener("loadedmetadata", () => {
+    upd();
+    if(v.currentTime < 0.05){
+      try{ v.currentTime = 0.1; }catch(e){}
+    }
+  });
   v.addEventListener("timeupdate", upd);
 
   $("#pvstart").onclick = () => {

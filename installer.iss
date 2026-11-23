@@ -3,7 +3,7 @@
 
 #define MyAppName "视频提取器"
 #define MyAppNameEn "VideoGrabber"
-#define MyAppVersion "1.4.1"
+#define MyAppVersion "1.4.2"
 #define MyAppPublisher "Local"
 #define MyAppExeName "VideoGrabber.exe"
 
