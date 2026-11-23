@@ -1285,10 +1285,10 @@ def _kill_task(tid):
 
 
 def _clean_uploads(max_age_h=24):
-    """清掉上传目录里放太久的文件。
+    """只清理上传中断留下的残片，**不动用户上传的源文件**。
 
-    上传的原片和转换中间产物都在这里，不及时清会一直涨——
-    实测一天能堆到 1.7 GB。
+    源文件可能是用户唯一的副本，程序不替用户做删除决定。
+    要腾空间自己删 upload_dir() 里的东西就行。
     """
     try:
         d = upload_dir()
@@ -1296,21 +1296,21 @@ def _clean_uploads(max_age_h=24):
         removed = 0
         freed = 0
         for name in os.listdir(d):
+            # 只处理 .incoming_ 这种半截文件，正常上传的文件一律保留
+            if not name.startswith(".incoming"):
+                continue
             p = os.path.join(d, name)
             if not os.path.isfile(p):
                 continue
             try:
-                age = now - os.path.getmtime(p)
-                # 中断的上传残留（.incoming_*）1 小时就清
-                limit = 3600 if name.startswith(".incoming") else max_age_h * 3600
-                if age > limit:
+                if now - os.path.getmtime(p) > 3600:
                     freed += os.path.getsize(p)
                     os.remove(p)
                     removed += 1
             except OSError:
                 pass
         if removed:
-            print(f"[clean] 清理上传缓存 {removed} 个文件，释放 {freed / 1024 ** 2:.1f} MB")
+            print(f"[clean] 清理中断残留 {removed} 个，释放 {freed / 1024 ** 2:.1f} MB")
     except Exception:
         pass
 
