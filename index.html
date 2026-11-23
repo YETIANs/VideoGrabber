@@ -914,7 +914,7 @@ $("#giflimit").onchange = e => {
   $("#gifwidth").disabled = on;
 };
 
-document.querySelectorAll(".gifquick button").forEach(b => {
+document.querySelectorAll(".gifquick button[data-kb]").forEach(b => {
   b.onclick = () => { $("#giftarget").value = b.dataset.kb; };
 });
 
