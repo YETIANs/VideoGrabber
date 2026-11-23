@@ -1554,6 +1554,196 @@ def _min_video_kbps(height, fps=30):
     return pick
 
 
+def trim_job(tid, src, out_dir, base, start, duration, mode="reencode"):
+    """裁剪片段。mode=copy 快但只能切在关键帧上，reencode 精确但慢。"""
+    with TASK_SEM:
+        _trim_job(tid, src, out_dir, base, start, duration, mode)
+
+
+def _trim_job(tid, src, out_dir, base, start, duration, mode="reencode"):
+    try:
+        ff = find_ffmpeg()
+        if not ff:
+            raise RuntimeError("没有 ffmpeg，无法裁剪")
+        os.makedirs(out_dir, exist_ok=True)
+        total = _video_duration(ff, src) or 0
+        st = max(0.0, float(start or 0))
+        du = float(duration) if duration else None
+        if total and st >= total:
+            raise RuntimeError(f"开始时间 {st:.1f}s 超出了视频总长 {total:.1f}s")
+        if du is None and total:
+            du = max(0.5, total - st)
+
+        final = os.path.join(out_dir, unique_base(out_dir, base) + ".mp4")
+        cmd = [ff, "-y", "-loglevel", "error", "-stats"]
+        # -ss 放在 -i 前面是快速定位，配合 copy 几乎瞬间完成
+        if st > 0:
+            cmd += ["-ss", f"{st:.3f}"]
+        cmd += ["-i", src]
+        if du:
+            cmd += ["-t", f"{du:.3f}"]
+        if mode == "copy":
+            cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-movflags", "+faststart", final]
+
+        set_task(tid, state="downloading", stage="裁剪中", progress=5)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace")
+        PROCS[tid] = proc
+        pct = 5
+        for line in proc.stderr:
+            m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
+            if m and du:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                pct = max(pct, min(96, 5 + int(sec / du * 91)))
+                set_task(tid, progress=pct)
+        proc.wait()
+        PROCS.pop(tid, None)
+        if tid in CANCELLED:
+            CANCELLED.discard(tid)
+            raise RuntimeError("已取消")
+
+        if proc.returncode != 0 or not os.path.isfile(final):
+            raise RuntimeError("裁剪失败，检查时间段是否超出视频范围")
+
+        _, _, _, od = _probe_video(ff, final)
+        if od <= 0:
+            raise RuntimeError("输出文件读不出来，裁剪失败")
+
+        set_task(tid, state="done", progress=100, stage="完成",
+                 file=os.path.basename(final), size=os.path.getsize(final),
+                 note=f"{st:.1f}s 起 · 时长 {od:.1f}s")
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200], progress=100)
+
+
+AUDIO_CODEC = {
+    "mp3": (["-c:a", "libmp3lame", "-q:a", "2"], ".mp3"),
+    "m4a": (["-c:a", "aac", "-b:a", "192k"], ".m4a"),
+    "wav": (["-c:a", "pcm_s16le"], ".wav"),
+}
+
+
+def audio_job(tid, src, out_dir, base, fmt="mp3", start=None, duration=None):
+    """从本地视频抽音轨。"""
+    with TASK_SEM:
+        _audio_job(tid, src, out_dir, base, fmt, start, duration)
+
+
+def _audio_job(tid, src, out_dir, base, fmt="mp3", start=None, duration=None):
+    try:
+        ff = find_ffmpeg()
+        if not ff:
+            raise RuntimeError("没有 ffmpeg，无法提取音频")
+        os.makedirs(out_dir, exist_ok=True)
+        fmt = fmt if fmt in AUDIO_CODEC else "mp3"
+        codec, ext = AUDIO_CODEC[fmt]
+        total = _video_duration(ff, src) or 0
+
+        final = os.path.join(out_dir, unique_base(out_dir, base) + ext)
+        cmd = [ff, "-y", "-loglevel", "error", "-stats"]
+        if start:
+            cmd += ["-ss", f"{float(start):.3f}"]
+        cmd += ["-i", src]
+        if duration:
+            cmd += ["-t", f"{float(duration):.3f}"]
+        cmd += ["-vn"] + codec + [final]
+
+        set_task(tid, state="downloading", stage="提取音频", progress=5)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace")
+        PROCS[tid] = proc
+        pct = 5
+        for line in proc.stderr:
+            m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
+            if m and total:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                pct = max(pct, min(96, 5 + int(sec / total * 91)))
+                set_task(tid, progress=pct)
+        proc.wait()
+        PROCS.pop(tid, None)
+        if tid in CANCELLED:
+            CANCELLED.discard(tid)
+            raise RuntimeError("已取消")
+
+        if proc.returncode != 0 or not os.path.isfile(final):
+            raise RuntimeError("提取失败，这个文件可能没有音轨")
+        if os.path.getsize(final) < 1024:
+            raise RuntimeError("音轨是空的，这个视频可能没有声音")
+
+        set_task(tid, state="done", progress=100, stage="完成",
+                 file=os.path.basename(final), size=os.path.getsize(final),
+                 note=f"{fmt.upper()}")
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200], progress=100)
+
+
+CONVERT_PRESET = {
+    "mp4": (["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"], ".mp4"),
+    "webm": (["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
+              "-c:a", "libopus", "-b:a", "96k"], ".webm"),
+    "mov": (["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k"], ".mov"),
+    "mkv": (["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k"], ".mkv"),
+}
+
+
+def convert_job(tid, src, out_dir, base, target="mp4"):
+    """转容器格式。"""
+    with TASK_SEM:
+        _convert_job(tid, src, out_dir, base, target)
+
+
+def _convert_job(tid, src, out_dir, base, target="mp4"):
+    try:
+        ff = find_ffmpeg()
+        if not ff:
+            raise RuntimeError("没有 ffmpeg，无法转格式")
+        os.makedirs(out_dir, exist_ok=True)
+        target = target if target in CONVERT_PRESET else "mp4"
+        codec, ext = CONVERT_PRESET[target]
+        total = _video_duration(ff, src) or 0
+
+        final = os.path.join(out_dir, unique_base(out_dir, base) + ext)
+        cmd = [ff, "-y", "-loglevel", "error", "-stats", "-i", src] + codec + [final]
+
+        set_task(tid, state="downloading", stage=f"转 {target.upper()}", progress=5)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace")
+        PROCS[tid] = proc
+        pct = 5
+        for line in proc.stderr:
+            m = re.search(r"time=(\d+):(\d+):(\d+\.?\d*)", line)
+            if m and total:
+                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                pct = max(pct, min(96, 5 + int(sec / total * 91)))
+                set_task(tid, progress=pct)
+        proc.wait()
+        PROCS.pop(tid, None)
+        if tid in CANCELLED:
+            CANCELLED.discard(tid)
+            raise RuntimeError("已取消")
+
+        if proc.returncode != 0 or not os.path.isfile(final):
+            raise RuntimeError("转换失败，检查源文件是否完好")
+        if os.path.getsize(final) < 1024:
+            raise RuntimeError("输出为空，转换失败")
+
+        set_task(tid, state="done", progress=100, stage="完成",
+                 file=os.path.basename(final), size=os.path.getsize(final),
+                 note=f"→ {target.upper()}")
+    except Exception as e:
+        set_task(tid, state="error", stage=str(e)[:200], progress=100)
+
+
 def compress_video_job(tid, src, out_dir, base, height, fps, crf, target_mb):
     """压缩视频。给了 target_mb 就按目标体积反算码率，否则按 CRF 走质量。
 
@@ -2230,6 +2420,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if t.get("state") in ("done", "error"):
                 return self._json({"error": "任务已结束"}, 400)
             return self._json({"error": "任务不在运行"}, 400)
+
+        if p.path == "/api/trim":
+            fn = os.path.basename(body.get("file") or "")
+            src = os.path.join(upload_dir(), fn)
+            if not fn or not os.path.isfile(src):
+                return self._json({"error": "先上传一个视频"}, 400)
+            base = os.path.splitext(fn)[0] + "_clip"
+            tid = hashlib.md5(f"t{time.time()}{fn}".encode()).hexdigest()[:12]
+            set_task(tid, state="queued", stage="排队中", progress=0, kind="video")
+            threading.Thread(
+                target=trim_job,
+                args=(tid, src, load_out(), base,
+                      body.get("start"), body.get("duration"),
+                      body.get("mode") or "reencode"),
+                daemon=True).start()
+            return self._json({"id": tid})
+
+        if p.path == "/api/audio":
+            fn = os.path.basename(body.get("file") or "")
+            src = os.path.join(upload_dir(), fn)
+            if not fn or not os.path.isfile(src):
+                return self._json({"error": "先上传一个视频"}, 400)
+            base = os.path.splitext(fn)[0]
+            tid = hashlib.md5(f"a{time.time()}{fn}".encode()).hexdigest()[:12]
+            set_task(tid, state="queued", stage="排队中", progress=0, kind="video")
+            threading.Thread(
+                target=audio_job,
+                args=(tid, src, load_out(), base,
+                      body.get("format") or "mp3",
+                      body.get("start"), body.get("duration")),
+                daemon=True).start()
+            return self._json({"id": tid})
+
+        if p.path == "/api/convert":
+            fn = os.path.basename(body.get("file") or "")
+            src = os.path.join(upload_dir(), fn)
+            if not fn or not os.path.isfile(src):
+                return self._json({"error": "先上传一个视频"}, 400)
+            base = os.path.splitext(fn)[0]
+            tid = hashlib.md5(f"v{time.time()}{fn}".encode()).hexdigest()[:12]
+            set_task(tid, state="queued", stage="排队中", progress=0, kind="video")
+            threading.Thread(
+                target=convert_job,
+                args=(tid, src, load_out(), base,
+                      body.get("target") or "mp4"),
+                daemon=True).start()
+            return self._json({"id": tid})
 
         if p.path == "/api/compress":
             fn = os.path.basename(body.get("file") or "")

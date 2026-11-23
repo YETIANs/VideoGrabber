@@ -13,6 +13,31 @@
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
+  .hrow{display:flex;align-items:center;justify-content:space-between}
+  .themebtn{
+    border:1px solid var(--line);background:var(--card);color:var(--muted);
+    width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:14px;
+    line-height:1;font-family:inherit
+  }
+  .themebtn:hover{border-color:var(--line-strong);color:var(--text)}
+  body.dark{
+    --bg:#131315; --card:#1b1b1e; --line:#2b2b31; --line-strong:#3a3a42;
+    --text:#e9e9ee; --muted:#9c9caa; --faint:#6e6e7a;
+  }
+  body.dark .pitem, body.dark .pitem:hover{background:#232328}
+  body.dark .drop{background:#1f1f23}
+  body.dark .drop:hover, body.dark .drop.over{background:#26262c}
+  body.dark input, body.dark select, body.dark .composer,
+  body.dark .gifrow select, body.dark .gifrow input,
+  body.dark .giftargetrow input, body.dark .gifquick button,
+  body.dark .cmpunit, body.dark .tab.on, body.dark .gifinfo,
+  body.dark .btn.ghost{background:#242429;color:var(--text)}
+  body.dark .tab{color:var(--muted)}
+  body.dark .tabs{background:#202025}
+  body.dark .gifinfo{color:#c8c8d2}
+  body.dark footer{border-color:#26262c}
+  body.dark .upfiles li:hover{background:#232328}
+  body.dark .gifresult, body.dark .upcache, body.dark .giftarget{border-color:#26262c}
   body{
     background:var(--bg); color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
@@ -182,7 +207,8 @@
   .drop:hover,.drop.over{border-color:#16161a;background:#f4f4f6}
   .dropinner b{display:block;font-size:13px;color:var(--text);font-weight:500;margin-bottom:4px}
   .dropinner span{font-size:11.5px;color:var(--faint)}
-  .nw{white-space:nowrap;display:inline}
+  .nw{white-space:nowrap}
+  .dropinner b.nw{display:inline}
   .gifopts{margin-top:14px}
   .gifinfo{
     font-size:12px;color:#4a4a54;background:#f7f7f9;border-radius:8px;
@@ -266,7 +292,10 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>本地视频提取</h1>
+    <div class="hrow">
+      <h1>本地视频提取</h1>
+      <button class="themebtn" id="theme" title="切换深色/浅色">☾</button>
+    </div>
     <p class="sub">贴链接，选画质，文件直接存到这台电脑上。</p>
   </header>
 
@@ -340,7 +369,10 @@
       <span class="ckbtn">
         <span class="tabs">
           <button class="tab on" data-mode="gif">转 GIF</button>
-          <button class="tab" data-mode="compress">压缩视频</button>
+          <button class="tab" data-mode="compress">压缩</button>
+          <button class="tab" data-mode="trim">裁剪</button>
+          <button class="tab" data-mode="audio">抽音频</button>
+          <button class="tab" data-mode="convert">转格式</button>
         </span>
         <button class="btn ghost sm" id="gifreset" hidden>换一个</button>
       </span>
@@ -471,6 +503,99 @@
         <div class="gifmeta">
           <a class="btn ghost sm" id="cmpdl" download>下载视频</a>
           <span id="cmpsize"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="gifopts" id="trimopts" hidden>
+      <div class="gifinfo" id="triminfo"></div>
+      <div class="gifrow">
+        <label>开始（秒）
+          <input id="trimstart" type="number" min="0" step="0.1" placeholder="0">
+        </label>
+        <label>时长（秒）
+          <input id="trimdur" type="number" min="0.3" step="0.1" placeholder="到结尾">
+        </label>
+        <label>方式
+          <select id="trimmode">
+            <option value="reencode" selected>精确（重编码）</option>
+            <option value="copy">快速（可能有偏移）</option>
+          </select>
+        </label>
+        <label>输出
+          <span class="cmphint">MP4</span>
+        </label>
+      </div>
+      <div class="gifactions">
+        <button class="btn" id="trimgo">开始裁剪</button>
+        <button class="btn ghost sm" id="trimcancel" hidden>取消</button>
+        <span class="gifprog" id="trimprog"></span>
+      </div>
+      <div class="gifresult" id="trimresult" hidden>
+        <div class="gifmeta">
+          <a class="btn ghost sm" id="trimdl" download>下载片段</a>
+          <span id="trimsize"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="gifopts" id="audioopts" hidden>
+      <div class="gifinfo" id="audioinfo"></div>
+      <div class="gifrow">
+        <label>格式
+          <select id="audiofmt">
+            <option value="mp3" selected>MP3（通用）</option>
+            <option value="m4a">M4A（音质好）</option>
+            <option value="wav">WAV（无损）</option>
+          </select>
+        </label>
+        <label>开始（秒）
+          <input id="audiostart" type="number" min="0" step="0.1" placeholder="0">
+        </label>
+        <label>时长（秒）
+          <input id="audiodur" type="number" min="0.3" step="0.1" placeholder="到结尾">
+        </label>
+        <label>说明
+          <span class="cmphint">只抽音轨</span>
+        </label>
+      </div>
+      <div class="gifactions">
+        <button class="btn" id="audiogo">提取音频</button>
+        <button class="btn ghost sm" id="audiocancel" hidden>取消</button>
+        <span class="gifprog" id="audioprog"></span>
+      </div>
+      <div class="gifresult" id="audioresult" hidden>
+        <div class="gifmeta">
+          <a class="btn ghost sm" id="audiodl" download>下载音频</a>
+          <span id="audiosize"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="gifopts" id="convopts" hidden>
+      <div class="gifinfo" id="convinfo"></div>
+      <div class="gifrow">
+        <label>目标格式
+          <select id="convtarget">
+            <option value="mp4" selected>MP4（兼容最好）</option>
+            <option value="webm">WebM（体积小）</option>
+            <option value="mov">MOV（苹果/剪辑）</option>
+            <option value="mkv">MKV（多轨）</option>
+          </select>
+        </label>
+        <label>说明
+          <span class="cmphint">重新编码</span>
+        </label>
+      </div>
+      <div class="gifactions">
+        <button class="btn" id="convgo">开始转换</button>
+        <button class="btn ghost sm" id="convcancel" hidden>取消</button>
+        <span class="gifprog" id="convprog"></span>
+      </div>
+      <div class="gifresult" id="convresult" hidden>
+        <div class="gifmeta">
+          <a class="btn ghost sm" id="convdl" download>下载文件</a>
+          <span id="convsize"></span>
         </div>
       </div>
     </div>
@@ -663,7 +788,113 @@ function esc(s){
 $("#paste").onclick = async () => {
   try{
     const t = await navigator.clipboard.readText();
-    if(t){ $("#url").value = t.trim(); $("#url").focus(); }
+    if(t){ $("#url").value = t.trim(); // ---------- 裁剪 / 抽音频 / 转格式 ----------
+const UI_TRIM = {btn:"#trimgo", cancel:"#trimcancel", prog:"#trimprog",
+                 result:"#trimresult", dl:"#trimdl", size:"#trimsize"};
+const UI_AUDIO = {btn:"#audiogo", cancel:"#audiocancel", prog:"#audioprog",
+                  result:"#audioresult", dl:"#audiodl", size:"#audiosize"};
+const UI_CONV = {btn:"#convgo", cancel:"#convcancel", prog:"#convprog",
+                 result:"#convresult", dl:"#convdl", size:"#convsize"};
+
+async function runJob(path, payload, ui){
+  if(!gifFile){ showMsg("先选一个视频", "err"); return; }
+  const btn = $(ui.btn);
+  btn.disabled = true;
+  $(ui.result).hidden = true;
+  $(ui.prog).textContent = "提交中…";
+  try{
+    const d = await api(path, Object.assign({}, payload, {file: gifFile}));
+    if(d.error){ showMsg(d.error, "err"); $(ui.prog).textContent = ""; return; }
+    pollJob(d.id, ui);
+  }catch(e){
+    showMsg("提交失败：" + e.message, "err");
+    $(ui.prog).textContent = "";
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+function pollJob(id, ui){
+  if(gifTimer) clearInterval(gifTimer);
+  $(ui.cancel).hidden = false;
+  $(ui.cancel).onclick = async () => {
+    try{ await api("/api/cancel", {id}); }catch(e){}
+    $(ui.cancel).hidden = true;
+    $(ui.prog).textContent = "已取消";
+  };
+  gifTimer = setInterval(async () => {
+    try{
+      const t = await (await fetch("/api/task?id=" + id)).json();
+      $(ui.prog).textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
+      if(t.state === "done"){
+        clearInterval(gifTimer); gifTimer = null;
+        $(ui.cancel).hidden = true;
+        $(ui.prog).textContent = "完成";
+        const url = "/file?n=" + encodeURIComponent(t.file);
+        $(ui.dl).href = url;
+        $(ui.dl).setAttribute("download", t.file);
+        $(ui.size).textContent = fmtSize(t.size || 0) + (t.note ? " · " + t.note : "");
+        $(ui.result).hidden = false;
+        loadFiles(); loadUploads();
+      }else if(t.state === "error"){
+        clearInterval(gifTimer); gifTimer = null;
+        $(ui.cancel).hidden = true;
+        $(ui.prog).textContent = "失败";
+        showMsg(t.stage || "处理失败", "err");
+      }
+    }catch(e){}
+  }, 900);
+}
+
+$("#trimgo").onclick = () => runJob("/api/trim", {
+  start: $("#trimstart").value || null,
+  duration: $("#trimdur").value || null,
+  mode: $("#trimmode").value
+}, UI_TRIM);
+
+$("#audiogo").onclick = () => runJob("/api/audio", {
+  format: $("#audiofmt").value,
+  start: $("#audiostart").value || null,
+  duration: $("#audiodur").value || null
+}, UI_AUDIO);
+
+$("#convgo").onclick = () => runJob("/api/convert", {
+  target: $("#convtarget").value
+}, UI_CONV);
+
+// ---------- 拖拽链接到页面直接解析 ----------
+["dragover", "drop"].forEach(ev => document.addEventListener(ev, e => {
+  if(e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files")) return;
+  e.preventDefault();
+}));
+document.addEventListener("drop", e => {
+  if(e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files")) return;
+  const raw = e.dataTransfer.getData("text/uri-list")
+           || e.dataTransfer.getData("text/plain") || "";
+  const url = raw.split(/\s+/).find(x => /^https?:\/\//i.test(x));
+  if(!url) return;
+  $("#url").value = url;
+  showMsg("已识别拖入的链接，正在解析", "info");
+  $("#go").click();
+});
+
+// ---------- 暗色模式 ----------
+(function(){
+  const KEY = "vg-theme";
+  const btn = $("#theme");
+  function apply(dark){
+    document.body.classList.toggle("dark", dark);
+    if(btn) btn.textContent = dark ? "☀" : "☾";
+  }
+  apply(localStorage.getItem(KEY) === "dark");
+  if(btn) btn.onclick = () => {
+    const dark = !document.body.classList.contains("dark");
+    apply(dark);
+    localStorage.setItem(KEY, dark ? "dark" : "light");
+  };
+})();
+
+$("#url").focus(); }
   }catch(e){
     showMsg("浏览器不允许读取剪贴板，直接 Ctrl+V 粘贴即可", "info");
   }
@@ -849,15 +1080,23 @@ loadPlatforms();
 let gifFile = null, gifTimer = null;
 
 let activeMode = "gif";
+const OPTS_MAP = { gif: "#gifopts", compress: "#cmpopts", trim: "#trimopts",
+                   audio: "#audioopts", convert: "#convopts" };
+
+function showOpts(){
+  Object.values(OPTS_MAP).forEach(id => { const el = $(id); if(el) el.hidden = true; });
+  if(gifFile && OPTS_MAP[activeMode]){
+    const el = $(OPTS_MAP[activeMode]);
+    if(el) el.hidden = false;
+  }
+}
+
 document.querySelectorAll(".tab").forEach(t => {
   t.onclick = () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
     t.classList.add("on");
     activeMode = t.dataset.mode;
-    if(gifFile){
-      $("#gifopts").hidden = activeMode !== "gif";
-      $("#cmpopts").hidden = activeMode !== "compress";
-    }
+    showOpts();
   };
 });
 
@@ -985,11 +1224,16 @@ async function handleGifFile(file){
         if(d.error){ showMsg(d.error, "err"); return resolve(); }
         gifFile = d.name;
         const tip = "已上传：" + d.name + " · " + fmtSize(d.size);
-        $("#gifinfo").textContent = tip;
-        $("#cmpinfo").textContent = tip;
+        ["#gifinfo","#cmpinfo","#triminfo","#audioinfo","#convinfo"].forEach(id => {
+          const el = $(id); if(el) el.textContent = tip;
+        });
+        showOpts();
         $("#gifreset").hidden = false;
         $("#gifgo").disabled = false;
         $("#cmpgo").disabled = false;
+        $("#trimgo").disabled = false;
+        $("#audiogo").disabled = false;
+        $("#convgo").disabled = false;
         loadUploads();
         resolve();
       };
