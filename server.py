@@ -2077,6 +2077,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = end - start + 1
         self.send_response(206 if partial else 200)
         self.send_header("Content-Type", mime)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if partial:
@@ -2086,6 +2087,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "Content-Disposition",
                 "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
         self.end_headers()
+        if self.command == "HEAD":      # 探测请求只回头，不回文件
+            return
         try:
             with open(path, "rb") as f:
                 f.seek(start)
@@ -2103,12 +2106,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         size = os.path.getsize(path)
         self.send_response(200)
         self.send_header("Content-Type", mime)
+        # 页面和文件都别缓存：改完版本用户刷新就能看到，不会被旧 HTML 卡住
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.send_header("Content-Length", str(size))
         if name:
             self.send_header(
                 "Content-Disposition",
                 "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
         self.end_headers()
+        if self.command == "HEAD":
+            return
         with open(path, "rb") as f:
             while True:
                 chunk = f.read(262144)
@@ -2225,6 +2232,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": f"保存失败：{e}"}, 500)
         return self._json({"ok": True, "name": os.path.basename(dest),
                            "size": size})
+
+    def do_HEAD(self):
+        """浏览器加载 <video> 前会先发 HEAD 探测，不支持就直接放弃了。"""
+        self.do_GET()
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)

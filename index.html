@@ -207,8 +207,7 @@
   .drop:hover,.drop.over{border-color:#16161a;background:#f4f4f6}
   .dropinner b{display:block;font-size:13px;color:var(--text);font-weight:500;margin-bottom:4px}
   .dropinner span{font-size:11.5px;color:var(--faint)}
-  .nw{white-space:nowrap}
-  .dropinner b.nw{display:inline}
+  .nw{white-space:nowrap;display:inline}
   .gifopts{margin-top:14px}
   .gifinfo{
     font-size:12px;color:#4a4a54;background:#f7f7f9;border-radius:8px;
@@ -811,171 +810,7 @@ function esc(s){
 $("#paste").onclick = async () => {
   try{
     const t = await navigator.clipboard.readText();
-    if(t){ $("#url").value = t.trim(); // ---------- 裁剪 / 抽音频 / 转格式 ----------
-const UI_TRIM = {btn:"#trimgo", cancel:"#trimcancel", prog:"#trimprog",
-                 result:"#trimresult", dl:"#trimdl", size:"#trimsize"};
-const UI_AUDIO = {btn:"#audiogo", cancel:"#audiocancel", prog:"#audioprog",
-                  result:"#audioresult", dl:"#audiodl", size:"#audiosize"};
-const UI_CONV = {btn:"#convgo", cancel:"#convcancel", prog:"#convprog",
-                 result:"#convresult", dl:"#convdl", size:"#convsize"};
-
-async function runJob(path, payload, ui){
-  if(!gifFile){ showMsg("先选一个视频", "err"); return; }
-  const btn = $(ui.btn);
-  btn.disabled = true;
-  $(ui.result).hidden = true;
-  $(ui.prog).textContent = "提交中…";
-  try{
-    const d = await api(path, Object.assign({}, payload, {file: gifFile}));
-    if(d.error){ showMsg(d.error, "err"); $(ui.prog).textContent = ""; return; }
-    pollJob(d.id, ui);
-  }catch(e){
-    showMsg("提交失败：" + e.message, "err");
-    $(ui.prog).textContent = "";
-  }finally{
-    btn.disabled = false;
-  }
-}
-
-function pollJob(id, ui){
-  if(gifTimer) clearInterval(gifTimer);
-  $(ui.cancel).hidden = false;
-  $(ui.cancel).onclick = async () => {
-    try{ await api("/api/cancel", {id}); }catch(e){}
-    $(ui.cancel).hidden = true;
-    $(ui.prog).textContent = "已取消";
-  };
-  gifTimer = setInterval(async () => {
-    try{
-      const t = await (await fetch("/api/task?id=" + id)).json();
-      $(ui.prog).textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
-      if(t.state === "done"){
-        clearInterval(gifTimer); gifTimer = null;
-        $(ui.cancel).hidden = true;
-        $(ui.prog).textContent = "完成";
-        const url = "/file?n=" + encodeURIComponent(t.file);
-        $(ui.dl).href = url;
-        $(ui.dl).setAttribute("download", t.file);
-        $(ui.size).textContent = fmtSize(t.size || 0) + (t.note ? " · " + t.note : "");
-        $(ui.result).hidden = false;
-        loadFiles(); loadUploads();
-      }else if(t.state === "error"){
-        clearInterval(gifTimer); gifTimer = null;
-        $(ui.cancel).hidden = true;
-        $(ui.prog).textContent = "失败";
-        showMsg(t.stage || "处理失败", "err");
-      }
-    }catch(e){}
-  }, 900);
-}
-
-$("#trimgo").onclick = () => runJob("/api/trim", {
-  start: $("#trimstart").value || null,
-  duration: $("#trimdur").value || null,
-  mode: $("#trimmode").value
-}, UI_TRIM);
-
-$("#audiogo").onclick = () => runJob("/api/audio", {
-  format: $("#audiofmt").value,
-  start: $("#audiostart").value || null,
-  duration: $("#audiodur").value || null
-}, UI_AUDIO);
-
-$("#convgo").onclick = () => runJob("/api/convert", {
-  target: $("#convtarget").value
-}, UI_CONV);
-
-// ---------- 拖拽链接到页面直接解析 ----------
-["dragover", "drop"].forEach(ev => document.addEventListener(ev, e => {
-  if(e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files")) return;
-  e.preventDefault();
-}));
-document.addEventListener("drop", e => {
-  if(e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files")) return;
-  const raw = e.dataTransfer.getData("text/uri-list")
-           || e.dataTransfer.getData("text/plain") || "";
-  const url = raw.split(/\s+/).find(x => /^https?:\/\//i.test(x));
-  if(!url) return;
-  $("#url").value = url;
-  showMsg("已识别拖入的链接，正在解析", "info");
-  $("#go").click();
-});
-
-// ---------- 暗色模式 ----------
-(function(){
-  const KEY = "vg-theme";
-  const btn = $("#theme");
-  function apply(dark){
-    document.body.classList.toggle("dark", dark);
-    if(btn) btn.textContent = dark ? "☀" : "☾";
-  }
-  apply(localStorage.getItem(KEY) === "dark");
-  if(btn) btn.onclick = () => {
-    const dark = !document.body.classList.contains("dark");
-    apply(dark);
-    localStorage.setItem(KEY, dark ? "dark" : "light");
-  };
-})();
-
-// ---------- 裁剪预览器 ----------
-function fmtTime(x){
-  if(!isFinite(x) || x < 0) return "00:00";
-  const m = Math.floor(x / 60), sec = Math.floor(x % 60);
-  return String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
-}
-
-function loadPreview(){
-  const v = $("#trimvideo");
-  if(!v) return;
-  if(!gifFile){ v.removeAttribute("src"); v.load(); return; }
-  // 带 #t=0.1，浏览器会 seek 到 0.1 秒并把那一帧画出来，
-  // 否则 preload 只拿元数据，画面是黑的
-  const src = "/preview?n=" + encodeURIComponent(gifFile) + "#t=0.1";
-  if(v.getAttribute("src") !== src){
-    v.src = src;
-    try{ v.load(); }catch(e){}
-  }
-  $("#pvtime").textContent = "00:00 / 00:00";
-}
-
-(function(){
-  const v = $("#trimvideo");
-  if(!v) return;
-  const upd = () => {
-    $("#pvtime").textContent =
-      fmtTime(v.currentTime) + " / " + fmtTime(v.duration || 0);
-  };
-  v.addEventListener("loadedmetadata", () => {
-    upd();
-    if(v.currentTime < 0.05){
-      try{ v.currentTime = 0.1; }catch(e){}
-    }
-  });
-  v.addEventListener("timeupdate", upd);
-
-  $("#pvstart").onclick = () => {
-    const t = v.currentTime;
-    $("#trimstart").value = t.toFixed(1);
-    const d = +$("#trimdur").value;
-    if(d && t + d > (v.duration || 1e9)) $("#trimdur").value = "";
-    showMsg("起点 " + t.toFixed(1) + " 秒", "info");
-  };
-  $("#pvend").onclick = () => {
-    const st = +$("#trimstart").value || 0;
-    const t = v.currentTime;
-    if(t <= st + 0.2){ showMsg("终点要在起点之后（当前 " + t.toFixed(1) + "s）", "err"); return; }
-    $("#trimdur").value = (t - st).toFixed(1);
-    showMsg("截取 " + st.toFixed(1) + "s → " + t.toFixed(1) + "s，共 " + (t - st).toFixed(1) + " 秒", "info");
-  };
-  $("#pvclear").onclick = () => {
-    $("#trimstart").value = "";
-    $("#trimdur").value = "";
-    v.currentTime = 0;
-    showMsg("已清除起止点", "info");
-  };
-})();
-
-$("#url").focus(); }
+    if(t){ $("#url").value = t.trim(); $("#url").focus(); }
   }catch(e){
     showMsg("浏览器不允许读取剪贴板，直接 Ctrl+V 粘贴即可", "info");
   }
@@ -1161,18 +996,6 @@ loadPlatforms();
 let gifFile = null, gifTimer = null;
 
 let activeMode = "gif";
-const OPTS_MAP = { gif: "#gifopts", compress: "#cmpopts", trim: "#trimopts",
-                   audio: "#audioopts", convert: "#convopts" };
-
-function showOpts(){
-  Object.values(OPTS_MAP).forEach(id => { const el = $(id); if(el) el.hidden = true; });
-  if(gifFile && OPTS_MAP[activeMode]){
-    const el = $(OPTS_MAP[activeMode]);
-    if(el) el.hidden = false;
-    if(activeMode === "trim" && typeof loadPreview === "function") loadPreview();
-  }
-}
-
 document.querySelectorAll(".tab").forEach(t => {
   t.onclick = () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.remove("on"));
@@ -1279,8 +1102,7 @@ async function handleGifFile(file){
   }
   const fd = new FormData();
   fd.append("file", file, file.name);
-  $("#gifopts").hidden = activeMode !== "gif";
-  $("#cmpopts").hidden = activeMode !== "compress";
+  showOpts();
   $("#gifresult").hidden = true;
   $("#cmpresult").hidden = true;
   $("#gifreset").hidden = true;
@@ -1306,8 +1128,10 @@ async function handleGifFile(file){
         if(d.error){ showMsg(d.error, "err"); return resolve(); }
         gifFile = d.name;
         const tip = "已上传：" + d.name + " · " + fmtSize(d.size);
+        $("#gifinfo").textContent = tip;
+        $("#cmpinfo").textContent = tip;
         ["#gifinfo","#cmpinfo","#triminfo","#audioinfo","#convinfo"].forEach(id => {
-          const el = $(id); if(el) el.textContent = tip;
+          const el = $(id); if(el) el.textContent = "已上传：" + d.name + " · " + fmtSize(d.size);
         });
         showOpts();
         $("#gifreset").hidden = false;
@@ -1639,6 +1463,174 @@ if(qs.get("url")){
   $("#url").value = qs.get("url");
   doParse();
 }
+
+// ================= 本地处理扩展（裁剪 / 抽音频 / 转格式 / 预览器 / 深色 / 拖拽） =================
+const OPTS_MAP = { gif: "#gifopts", compress: "#cmpopts", trim: "#trimopts",
+                   audio: "#audioopts", convert: "#convopts" };
+
+function showOpts(){
+  Object.values(OPTS_MAP).forEach(id => { const el = $(id); if(el) el.hidden = true; });
+  if(gifFile && OPTS_MAP[activeMode]){
+    const el = $(OPTS_MAP[activeMode]);
+    if(el) el.hidden = false;
+    if(activeMode === "trim" && typeof loadPreview === "function") loadPreview();
+  }
+}
+
+const UI_TRIM = {btn:"#trimgo", cancel:"#trimcancel", prog:"#trimprog",
+                 result:"#trimresult", dl:"#trimdl", size:"#trimsize"};
+const UI_AUDIO = {btn:"#audiogo", cancel:"#audiocancel", prog:"#audioprog",
+                  result:"#audioresult", dl:"#audiodl", size:"#audiosize"};
+const UI_CONV = {btn:"#convgo", cancel:"#convcancel", prog:"#convprog",
+                 result:"#convresult", dl:"#convdl", size:"#convsize"};
+
+async function runJob(path, payload, ui){
+  if(!gifFile){ showMsg("先选一个视频", "err"); return; }
+  const btn = $(ui.btn);
+  btn.disabled = true;
+  $(ui.result).hidden = true;
+  $(ui.prog).textContent = "提交中…";
+  try{
+    const d = await api(path, Object.assign({}, payload, {file: gifFile}));
+    if(d.error){ showMsg(d.error, "err"); $(ui.prog).textContent = ""; return; }
+    pollJob(d.id, ui);
+  }catch(e){
+    showMsg("提交失败：" + e.message, "err");
+    $(ui.prog).textContent = "";
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+function pollJob(id, ui){
+  if(gifTimer) clearInterval(gifTimer);
+  $(ui.cancel).hidden = false;
+  $(ui.cancel).onclick = async () => {
+    try{ await api("/api/cancel", {id}); }catch(e){}
+    $(ui.cancel).hidden = true;
+    $(ui.prog).textContent = "已取消";
+  };
+  gifTimer = setInterval(async () => {
+    try{
+      const t = await (await fetch("/api/task?id=" + id)).json();
+      $(ui.prog).textContent = (t.stage || "") + " " + (t.progress || 0) + "%";
+      if(t.state === "done"){
+        clearInterval(gifTimer); gifTimer = null;
+        $(ui.cancel).hidden = true;
+        $(ui.prog).textContent = "完成";
+        const url = "/file?n=" + encodeURIComponent(t.file);
+        $(ui.dl).href = url;
+        $(ui.dl).setAttribute("download", t.file);
+        $(ui.size).textContent = fmtSize(t.size || 0) + (t.note ? " · " + t.note : "");
+        $(ui.result).hidden = false;
+        loadFiles(); loadUploads();
+      }else if(t.state === "error"){
+        clearInterval(gifTimer); gifTimer = null;
+        $(ui.cancel).hidden = true;
+        $(ui.prog).textContent = "失败";
+        showMsg(t.stage || "处理失败", "err");
+      }
+    }catch(e){}
+  }, 900);
+}
+
+$("#trimgo").onclick = () => runJob("/api/trim", {
+  start: $("#trimstart").value || null,
+  duration: $("#trimdur").value || null,
+  mode: $("#trimmode").value
+}, UI_TRIM);
+
+$("#audiogo").onclick = () => runJob("/api/audio", {
+  format: $("#audiofmt").value,
+  start: $("#audiostart").value || null,
+  duration: $("#audiodur").value || null
+}, UI_AUDIO);
+
+$("#convgo").onclick = () => runJob("/api/convert", {
+  target: $("#convtarget").value
+}, UI_CONV);
+
+// ---------- 裁剪预览器 ----------
+function fmtTime(x){
+  if(!isFinite(x) || x < 0) return "00:00";
+  const m = Math.floor(x / 60), sec = Math.floor(x % 60);
+  return String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+}
+
+function loadPreview(){
+  const v = $("#trimvideo");
+  if(!v) return;
+  if(!gifFile){ v.removeAttribute("src"); try{ v.load(); }catch(e){} return; }
+  const src = "/preview?n=" + encodeURIComponent(gifFile) + "#t=0.1";
+  if(v.getAttribute("src") !== src){
+    v.src = src;
+    try{ v.load(); }catch(e){}
+  }
+}
+
+(function(){
+  const v = $("#trimvideo");
+  if(!v) return;
+  const upd = () => {
+    $("#pvtime").textContent = fmtTime(v.currentTime) + " / " + fmtTime(v.duration || 0);
+  };
+  v.addEventListener("loadedmetadata", () => {
+    upd();
+    if(v.currentTime < 0.05){ try{ v.currentTime = 0.1; }catch(e){} }
+  });
+  v.addEventListener("timeupdate", upd);
+
+  $("#pvstart").onclick = () => {
+    const t = v.currentTime;
+    $("#trimstart").value = t.toFixed(1);
+    showMsg("起点 " + t.toFixed(1) + " 秒", "info");
+  };
+  $("#pvend").onclick = () => {
+    const st = +$("#trimstart").value || 0;
+    const t = v.currentTime;
+    if(t <= st + 0.2){ showMsg("终点要在起点之后", "err"); return; }
+    $("#trimdur").value = (t - st).toFixed(1);
+    showMsg("截取 " + st.toFixed(1) + "s → " + t.toFixed(1) + "s，共 " + (t - st).toFixed(1) + " 秒", "info");
+  };
+  $("#pvclear").onclick = () => {
+    $("#trimstart").value = "";
+    $("#trimdur").value = "";
+    try{ v.currentTime = 0; }catch(e){}
+  };
+})();
+
+// ---------- 拖拽链接 ----------
+["dragover", "drop"].forEach(ev => document.addEventListener(ev, e => {
+  if(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) return;
+  e.preventDefault();
+}));
+document.addEventListener("drop", e => {
+  if(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) return;
+  const raw = e.dataTransfer.getData("text/uri-list")
+           || e.dataTransfer.getData("text/plain") || "";
+  const u = raw.split(/\s+/).find(x => /^https?:\/\//i.test(x));
+  if(!u || typeof doParse !== "function") return;
+  $("#url").value = u;
+  showMsg("已识别拖入的链接，正在解析", "info");
+  doParse();
+});
+
+// ---------- 深色模式 ----------
+(function(){
+  const KEY = "vg-theme";
+  const btn = $("#theme");
+  function apply(dark){
+    document.body.classList.toggle("dark", dark);
+    if(btn) btn.textContent = dark ? "☀" : "☾";
+  }
+  try{ apply(localStorage.getItem(KEY) === "dark"); }catch(e){}
+  if(btn) btn.onclick = () => {
+    const dark = !document.body.classList.contains("dark");
+    apply(dark);
+    try{ localStorage.setItem(KEY, dark ? "dark" : "light"); }catch(e){}
+  };
+})();
+
 </script>
 </body>
 </html>
